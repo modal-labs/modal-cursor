@@ -1,0 +1,63 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.uv]
+package = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--strict-config --strict-markers"
+
+[tool.coverage.run]
+branch = true
+source = ["modal_cursor"]
+omit = ["modal_cursor/__main__.py", "modal_cursor/_spawn_bridge.py"]
+
+[tool.coverage.report]
+fail_under = 80
+show_missing = true
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "RUF", "BLE", "C4", "SIM", "PL"]
+
+[tool.ruff.lint.per-file-ignores]
+"modal_cursor/__init__.py" = ["PLC0415"]
+"modal_cursor/cli.py" = ["PLR0913"]
+"modal_cursor/spawn.py" = ["PLC0415"]
+"tests/*" = ["PLR2004"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+packages = ["modal_cursor"]
+plugins = ["pydantic.mypy"]
+
+[project]
+name = "modal-cursor"
+version = "0.1.0"
+description = "Modal-backed controller for Cursor bring-your-own-machine worker pools."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "cyclopts>=4.20,<5",
+    "httpx>=0.28.1,<1",
+    "modal>=1.5.4,<2",
+    "pydantic-settings>=2.15.0,<3",
+    "rich>=13.6,<16",
+]
+
+[project.scripts]
+modal-cursor = "modal_cursor.cli:run"
+
+[dependency-groups]
+dev = [
+    "coverage>=7.10",
+    "mypy>=1.17",
+    "pytest>=9.1.1",
+    "ruff>=0.12",
+]

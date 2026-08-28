@@ -1,0 +1,59 @@
+"""Modal application for one Cursor worker pool.
+
+Generated once by modal-cursor. This is application code and may be edited.
+"""
+
+import modal
+
+from modal_cursor import Pool
+from modal_cursor.spawn import spawn_worker
+
+CURSOR_SECRET_NAME = "cursor-service-account"
+WORKER_SECRET_NAMES = ()
+
+pool = Pool(
+    "modal-demo",
+    repo_url=None,
+    scope="team",
+    worker_ready_timeout_s=0,
+    api_endpoint="https://api.cursor.com",
+)
+app = modal.App("modal-cursor-modal-demo", tags={"service": "modal-cursor"})
+
+cursor_secret = modal.Secret.from_name(
+    CURSOR_SECRET_NAME,
+    required_keys=["CURSOR_API_KEY"],
+)
+worker_secrets = [modal.Secret.from_name(name) for name in WORKER_SECRET_NAMES]
+controller_image = pool.controller_image()
+
+worker_image = (
+    pool.worker_image()
+    # Add every application-specific build step here.
+    # .apt_install("ripgrep")
+)
+
+worker = pool.machine(
+    image=worker_image,
+    secrets=worker_secrets,
+    # gpu="A10G",
+    # cpu=4,
+    # memory=16384,
+)
+
+
+@app.function(
+    image=controller_image,
+    secrets=[cursor_secret],
+    max_containers=1,
+    retries=modal.Retries(max_retries=10),
+    timeout=24 * 3600,
+)
+def controller() -> None:
+    pool.register()
+    pool.run_controller()
+
+
+@app.function(image=controller_image, secrets=[cursor_secret])
+def spawner(claim_env: dict[str, object]) -> str:
+    return spawn_worker(pool, worker, app, claim_env)
