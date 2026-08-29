@@ -29,7 +29,7 @@ CLAIM_PAYLOAD = {
 def test_spawn_worker_provisions_sandbox_from_one_machine(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    pool = Pool("gpu")
+    pool = Pool(name="gpu")
     worker = pool.machine(image="image", gpu="A10G")
     create = Mock(return_value=SimpleNamespace(object_id="sb-1"))
     monkeypatch.setattr(modal.Sandbox, "create", create)
@@ -68,7 +68,7 @@ def test_worker_readiness_detects_early_exit_and_timeout(
 def test_spawn_worker_rejects_cross_pool_claim() -> None:
     with pytest.raises(ConfigError, match="reached spawner"):
         spawn_module.spawn_worker(
-            Pool("other"), Pool("other").machine(image="image"), "app", CLAIM_PAYLOAD
+            Pool(name="other"), Pool(name="other").machine(image="image"), "app", CLAIM_PAYLOAD
         )
 
 

@@ -80,6 +80,11 @@ requires it. Private repository credentials are separate: workers receive
 `GITHUB_TOKEN` only when their generated configuration includes the requested
 GitHub Modal Secret.
 
+Runtime tuning is available through the optional `MODAL_CURSOR_SANDBOX_TIMEOUT_S`,
+`MODAL_CURSOR_IDLE_RELEASE_TIMEOUT_S`, `MODAL_CURSOR_SPAWNER_READY_TIMEOUT_S`,
+`MODAL_CURSOR_WORKER_POLL_INTERVAL_S`, `MODAL_CURSOR_CONTROLLER_TIMEOUT_S`, and
+`MODAL_CURSOR_CONTROLLER_MAX_RETRIES` environment variables.
+
 ## Operations
 
 `modal-cursor doctor` checks more than object existence. It verifies Modal
@@ -100,6 +105,7 @@ uv sync --all-groups
 uv run ruff format --check modal_cursor tests
 uv run ruff check modal_cursor tests
 uv run mypy
+uv run basedpyright
 uv run coverage run -m pytest
 uv run coverage report
 uv build

@@ -54,7 +54,7 @@ def test_init_generates_owned_single_pool_app(
 
     assert "pool.register()" in source
     assert "spawn_worker(pool, worker, app, claim_env)" in source
-    assert "modal.Retries(max_retries=10)" in source
+    assert "settings.controller_max_retries" in source
     assert namespace["pool"].worker_ready_timeout_s == 900
     assert namespace["CURSOR_SECRET_NAME"] == "cursor-service-account"
     assert namespace["WORKER_SECRET_NAMES"] == ()
@@ -165,7 +165,7 @@ def test_deploy_reports_each_failure(tmp_path: Path, monkeypatch: pytest.MonkeyP
 def test_stop_modal_app_handles_absence_sdk_and_cli_failures(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    pool = Pool("gpu")
+    pool = Pool(name="gpu")
     lookup = Mock(side_effect=modal.exception.NotFoundError("missing"))
     monkeypatch.setattr(cli.modal.App, "lookup", lookup)
     assert cli._stop_modal_app(pool)
@@ -191,7 +191,7 @@ def test_stop_modal_app_handles_absence_sdk_and_cli_failures(
 
 
 def test_deregister_matches_handles_absent_and_failed_records() -> None:
-    pool = Pool("gpu")
+    pool = Pool(name="gpu")
     client = httpx.Client(
         base_url="https://cursor.test",
         transport=httpx.MockTransport(lambda request: httpx.Response(500)),
@@ -269,7 +269,7 @@ def test_destroy_requires_confirmation_and_service_key(
 def test_registry_drift_counts_both_directions(tmp_path: Path) -> None:
     registered = RegisteredPool.from_payload(_registry_payload(name="orphan"))
     failures = cli._check_registry(
-        [(tmp_path / "missing.py", Pool("missing"))], [registered], "team"
+        [(tmp_path / "missing.py", Pool(name="missing"))], [registered], "team"
     )
     assert failures == 2
 

@@ -6,7 +6,14 @@ import sys
 import pytest
 from pydantic import ValidationError
 
-from modal_cursor.pools import Claim, ConfigError, Machine, build_entrypoint, build_worker_env
+from modal_cursor.pools import (
+    Claim,
+    ConfigError,
+    Machine,
+    RuntimeSettings,
+    build_entrypoint,
+    build_worker_env,
+)
 
 
 def _claim(**overrides: object) -> Claim:
@@ -36,6 +43,22 @@ def test_claim_reads_required_cursor_settings(monkeypatch: pytest.MonkeyPatch) -
     )
 
 
+def test_runtime_settings_read_operator_overrides(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MODAL_CURSOR_SANDBOX_TIMEOUT_S", "900")
+    monkeypatch.setenv("MODAL_CURSOR_IDLE_RELEASE_TIMEOUT_S", "30")
+    monkeypatch.setenv("MODAL_CURSOR_SPAWNER_READY_TIMEOUT_S", "45")
+    monkeypatch.setenv("MODAL_CURSOR_WORKER_POLL_INTERVAL_S", "0.5")
+
+    assert RuntimeSettings().model_dump() == {
+        "sandbox_timeout_s": 900,
+        "idle_release_timeout_s": 30,
+        "spawner_ready_timeout_s": 45.0,
+        "worker_poll_interval_s": 0.5,
+        "controller_timeout_s": 24 * 3600,
+        "controller_max_retries": 10,
+    }
+
+
 @pytest.mark.parametrize("missing", ["agent_worker_id", "pool", "request_id"])
 def test_claim_requires_complete_claim_identity(missing: str) -> None:
     values = {"agent_worker_id": "pw", "pool": "gpu", "request_id": "bc"}
@@ -61,10 +84,12 @@ def test_machine_is_immutable_and_rejects_reserved_overrides() -> None:
     assert machine.env["APP_ENV"] == "production"
     with pytest.raises(TypeError):
         machine.env["APP_ENV"] = "changed"  # type: ignore[index]
-    with pytest.raises(ConfigError, match="CURSOR_API_KEY"):
+    with pytest.raises(ValidationError, match="CURSOR_API_KEY") as error:
         Machine(image="image", env={"CURSOR_API_KEY": "wrong"})
-    with pytest.raises(ConfigError, match="managed"):
+    assert error.value.errors()[0]["type"] == "machine_env_contains_reserved_variable"
+    with pytest.raises(ValidationError, match="managed") as error:
         Machine(image="image", sandbox_options={"timeout": 30})
+    assert error.value.errors()[0]["type"] == "machine_sandbox_options_contains_reserved_option"
 
 
 def test_worker_environment_preserves_claim_identity() -> None:

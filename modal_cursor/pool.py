@@ -6,19 +6,18 @@ import os
 import re
 import subprocess
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
 import modal
+from pydantic import BaseModel, ConfigDict, field_validator, model_validator
+from pydantic_core import PydanticCustomError
 
 from modal_cursor.pools import (
     APP_NAME_ENV,
     CURSOR_AGENT_PATH,
-    DEFAULT_IDLE_RELEASE_S,
-    DEFAULT_TIMEOUT_S,
-    ConfigError,
     Machine,
+    RuntimeSettings,
 )
 from modal_cursor.registry import (
     DEFAULT_API_ENDPOINT,
@@ -64,9 +63,10 @@ def _cursor_cli_image(*extra_apt: str) -> modal.Image:
     )
 
 
-@dataclass(frozen=True, slots=True)
-class Pool:
+class Pool(BaseModel):
     """One Cursor routing pool and its canonical Modal application identity."""
+
+    model_config = ConfigDict(frozen=True, strict=True)
 
     name: str
     repo_url: str | None = None
@@ -74,22 +74,40 @@ class Pool:
     worker_ready_timeout_s: int = 0
     api_endpoint: str = DEFAULT_API_ENDPOINT
 
-    def __post_init__(self) -> None:
-        if not (0 < len(self.name) <= MAX_NAME_LENGTH) or not _POOL_NAME_RE.fullmatch(self.name):
-            raise ConfigError(
-                f"pool name {self.name!r} must be 1-{MAX_NAME_LENGTH} chars of lowercase "
-                "letters, digits, and dashes, starting and ending with a letter or digit"
+    @field_validator("name")
+    @classmethod
+    def _valid_name(cls, value: str) -> str:
+        if not (0 < len(value) <= MAX_NAME_LENGTH) or not _POOL_NAME_RE.fullmatch(value):
+            raise PydanticCustomError(
+                "pool_name_has_invalid_format",
+                "pool name {name!r} must be 1-{max_length} chars of lowercase "
+                "letters, digits, and dashes, starting and ending with a letter or digit",
+                {"name": value, "max_length": MAX_NAME_LENGTH},
             )
-        if self.scope not in ("team", "user"):
-            raise ConfigError("scope must be 'team' or 'user'")
-        if self.worker_ready_timeout_s < 0:
-            raise ConfigError("worker_ready_timeout_s must be zero or greater")
-        if self.repo_url is not None:
+        return value
+
+    @field_validator("repo_url")
+    @classmethod
+    def _normalize_repo_url(cls, value: str | None) -> str | None:
+        if value is not None:
             try:
-                repository = Repository.from_url(self.repo_url)
+                return Repository.from_url(value).url
             except ValueError as error:
-                raise ConfigError(str(error)) from error
-            object.__setattr__(self, "repo_url", repository.url)
+                raise PydanticCustomError(
+                    "pool_repo_url_must_be_github_https",
+                    "invalid repository URL: {reason}",
+                    {"reason": str(error)},
+                ) from error
+        return None
+
+    @model_validator(mode="after")
+    def _valid_values(self) -> Pool:
+        if self.worker_ready_timeout_s < 0:
+            raise PydanticCustomError(
+                "pool_worker_ready_timeout_s_must_be_non_negative",
+                "worker_ready_timeout_s must be zero or greater",
+            )
+        return self
 
     @property
     def app_name(self) -> str:
@@ -125,17 +143,20 @@ class Pool:
         image: modal.Image,
         secrets: Sequence[modal.Secret] = (),
         env: Mapping[str, str] | None = None,
-        timeout_s: int = DEFAULT_TIMEOUT_S,
-        idle_release_s: int = DEFAULT_IDLE_RELEASE_S,
+        timeout_s: int | None = None,
+        idle_release_s: int | None = None,
         **sandbox_options: object,
     ) -> Machine:
         """Bind worker lifecycle policy while forwarding Modal sandbox options."""
+        settings = RuntimeSettings()
         return Machine(
             image=image,
             secrets=tuple(secrets),
             env={} if env is None else env,
-            timeout_s=timeout_s,
-            idle_release_s=idle_release_s,
+            timeout_s=settings.sandbox_timeout_s if timeout_s is None else timeout_s,
+            idle_release_s=(
+                settings.idle_release_timeout_s if idle_release_s is None else idle_release_s
+            ),
             sandbox_options=sandbox_options,
         )
 

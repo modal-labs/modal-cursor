@@ -7,16 +7,17 @@ from unittest.mock import Mock
 
 import httpx
 import pytest
+from pydantic import ValidationError
 
 from modal_cursor import Pool
 from modal_cursor import pool as pool_module
 from modal_cursor.pool import SPAWN_BRIDGE_PATH
-from modal_cursor.pools import APP_NAME_ENV, ConfigError
+from modal_cursor.pools import APP_NAME_ENV
 
 
 @pytest.mark.parametrize("name", ["h100", "gpu-training", "a", "x1-y2", "0-default"])
 def test_valid_pool_names(name: str) -> None:
-    assert Pool(name).name == name
+    assert Pool(name=name).name == name
 
 
 @pytest.mark.parametrize(
@@ -24,24 +25,26 @@ def test_valid_pool_names(name: str) -> None:
     ["", "GPU Training", "UPPER", "-leading", "trailing-", "under_score", "a" * 51],
 )
 def test_invalid_pool_names(name: str) -> None:
-    with pytest.raises(ConfigError, match="pool name"):
-        Pool(name)
+    with pytest.raises(ValidationError, match="pool name") as error:
+        Pool(name=name)
+    assert error.value.errors()[0]["type"] == "pool_name_has_invalid_format"
 
 
 def test_pool_validates_current_registration_contract() -> None:
     pool = Pool(
-        "payments",
+        name="payments",
         repo_url="https://github.com/acme/payments.git",
         worker_ready_timeout_s=900,
     )
     assert pool.repo_url == "https://github.com/acme/payments"
     assert pool.registration.request_body()["workerReadyTimeoutSeconds"] == 900
-    with pytest.raises(ConfigError, match="HTTPS GitHub"):
-        Pool("bad", repo_url="https://gitlab.com/acme/project")
+    with pytest.raises(ValidationError, match="HTTPS GitHub") as error:
+        Pool(name="bad", repo_url="https://gitlab.com/acme/project")
+    assert error.value.errors()[0]["type"] == "pool_repo_url_must_be_github_https"
 
 
 def test_machine_forwards_modal_options_without_copying_pool_metadata() -> None:
-    machine = Pool("payments", repo_url="https://github.com/acme/payments").machine(
+    machine = Pool(name="payments", repo_url="https://github.com/acme/payments").machine(
         image="image", gpu="A10G", region="us-east"
     )
     assert dict(machine.sandbox_options) == {"gpu": "A10G", "region": "us-east"}
@@ -61,7 +64,7 @@ def test_register_uses_pool_metadata(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(pool_module, "cursor_client", lambda endpoint, token: client)
 
     Pool(
-        "payments",
+        name="payments",
         repo_url="https://github.com/acme/payments",
         worker_ready_timeout_s=600,
     ).register()
@@ -76,7 +79,7 @@ def test_controller_uses_one_real_executable_path(monkeypatch: pytest.MonkeyPatc
     monkeypatch.setattr(pool_module.subprocess, "run", run)
     monkeypatch.setenv("CURSOR_API_KEY", "service-key")
 
-    Pool("gpu").run_controller()
+    Pool(name="gpu").run_controller()
 
     argv = run.call_args.args[0]
     spawn_index = argv.index("--spawn") + 1

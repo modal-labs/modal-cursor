@@ -1,41 +1,23 @@
-"""Modal application for one Cursor worker pool.
-
-Generated once by modal-cursor. This is application code and may be edited.
-"""
+"""Generated Modal application for one editable Cursor worker pool."""
 
 import modal
 
 from modal_cursor import Pool
+from modal_cursor.pools import RuntimeSettings
 from modal_cursor.spawn import spawn_worker
 
 CURSOR_SECRET_NAME = $secret_name
 WORKER_SECRET_NAMES = $worker_secret_names
 
-pool = Pool(
-    $pool_name,
-    repo_url=$repo_url,
-    scope=$scope,
-    worker_ready_timeout_s=$worker_ready_timeout_s,
-    api_endpoint=$api_endpoint,
-)
+pool = Pool(name=$pool_name$pool_options)
+settings = RuntimeSettings()
 app = modal.App($app_name, tags={"service": "modal-cursor"})
 
-cursor_secret = modal.Secret.from_name(
-    CURSOR_SECRET_NAME,
-    required_keys=["CURSOR_API_KEY"],
-)
-worker_secrets = [modal.Secret.from_name(name) for name in WORKER_SECRET_NAMES]
+cursor_secret = modal.Secret.from_name(CURSOR_SECRET_NAME, required_keys=["CURSOR_API_KEY"])
 controller_image = pool.controller_image()
-
-worker_image = (
-    pool.worker_image()
-    # Add every application-specific build step here.
-    # .apt_install("ripgrep")
-)
-
 worker = pool.machine(
-    image=worker_image,
-    secrets=worker_secrets,
+    image=pool.worker_image(),  # Add application-specific image layers here.
+    secrets=[modal.Secret.from_name(name) for name in WORKER_SECRET_NAMES],
     # gpu="A10G",
     # cpu=4,
     # memory=16384,
@@ -46,8 +28,8 @@ worker = pool.machine(
     image=controller_image,
     secrets=[cursor_secret],
     max_containers=1,
-    retries=modal.Retries(max_retries=10),
-    timeout=24 * 3600,
+    retries=modal.Retries(max_retries=settings.controller_max_retries),
+    timeout=settings.controller_timeout_s,
 )
 def controller() -> None:
     pool.register()

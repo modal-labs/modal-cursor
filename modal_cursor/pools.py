@@ -5,19 +5,23 @@ from __future__ import annotations
 import json
 import shlex
 from collections.abc import Mapping
-from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Annotated, LiteralString, Self, TypeVar, cast
 from urllib.parse import urlsplit
 
-from pydantic import field_validator
+from pydantic import AfterValidator, BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic_core import PydanticCustomError
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 if TYPE_CHECKING:
     import modal
 
-DEFAULT_TIMEOUT_S = 6 * 3600
-DEFAULT_IDLE_RELEASE_S = 600
+    Image = modal.Image
+    Secret = modal.Secret
+else:
+    Image = object
+    Secret = object
+
 MAX_REPOSITORIES = 20
 WORKSPACE = "/workspace"
 CURSOR_AGENT_PATH = "/root/.local/bin/agent"
@@ -41,36 +45,90 @@ class ConfigError(ValueError):
     """Local pool or claim configuration violates a required contract."""
 
 
-@dataclass(frozen=True, slots=True)
-class Machine:
+class RuntimeSettings(BaseSettings):
+    """Operator-tunable worker lifecycle defaults."""
+
+    model_config = SettingsConfigDict(env_prefix="MODAL_CURSOR_", extra="ignore")
+
+    sandbox_timeout_s: Annotated[
+        int, Field(gt=0, description="Maximum lifetime of each Modal worker sandbox in seconds.")
+    ] = 6 * 3600
+    idle_release_timeout_s: Annotated[
+        int, Field(ge=0, description="Seconds of worker idleness before the sandbox is released.")
+    ] = 600
+    spawner_ready_timeout_s: Annotated[
+        float, Field(ge=0, description="Seconds to wait for Cursor to observe a new worker.")
+    ] = 120
+    worker_poll_interval_s: Annotated[
+        float, Field(gt=0, description="Seconds between Cursor worker readiness checks.")
+    ] = 1.0
+    controller_timeout_s: Annotated[
+        int, Field(gt=0, description="Maximum runtime of a controller invocation in seconds.")
+    ] = 24 * 3600
+    controller_max_retries: Annotated[
+        int, Field(ge=0, description="Maximum number of retries for a controller invocation.")
+    ] = 10
+
+
+def _reject_reserved(
+    values: Mapping[str, object], reserved: set[str], code: LiteralString, message: str
+) -> None:
+    names = sorted(reserved & values.keys())
+    if names:
+        raise PydanticCustomError(
+            code,
+            "{message}: {names}",
+            {"message": message, "names": ", ".join(names)},
+        )
+
+
+_MappingValue = TypeVar("_MappingValue")
+
+
+def _freeze_mapping(value: Mapping[str, _MappingValue]) -> Mapping[str, _MappingValue]:
+    return cast(Mapping[str, _MappingValue], MappingProxyType(dict(value)))
+
+
+FrozenEnvironment = Annotated[Mapping[str, str], AfterValidator(_freeze_mapping)]
+FrozenSandboxOptions = Annotated[Mapping[str, object], AfterValidator(_freeze_mapping)]
+
+
+class Machine(BaseModel):
     """Modal sandbox configuration that is independent of pool registration."""
 
-    image: modal.Image
-    secrets: tuple[modal.Secret, ...] = ()
-    env: Mapping[str, str] = field(default_factory=dict)
-    timeout_s: int = DEFAULT_TIMEOUT_S
-    idle_release_s: int = DEFAULT_IDLE_RELEASE_S
-    sandbox_options: Mapping[str, object] = field(default_factory=dict)
+    model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True, validate_default=True)
 
-    def __post_init__(self) -> None:
+    image: Image
+    secrets: tuple[Secret, ...] = ()
+    env: FrozenEnvironment = Field(default_factory=dict[str, str])
+    timeout_s: int = Field(default_factory=lambda: RuntimeSettings().sandbox_timeout_s)
+    idle_release_s: int = Field(default_factory=lambda: RuntimeSettings().idle_release_timeout_s)
+    sandbox_options: FrozenSandboxOptions = Field(default_factory=dict[str, object])
+
+    @model_validator(mode="after")
+    def validate_values(self) -> Self:
         if self.timeout_s <= 0:
-            raise ConfigError("timeout_s must be greater than zero")
+            raise PydanticCustomError(
+                "machine_timeout_s_must_be_positive", "timeout_s must be greater than zero"
+            )
         if self.idle_release_s < 0:
-            raise ConfigError("idle_release_s must be zero or greater")
-        env = dict(self.env)
-        reserved_env = sorted(_RESERVED_WORKER_ENV & env.keys())
-        if reserved_env:
-            raise ConfigError(
-                "env cannot override Cursor-managed variables: " + ", ".join(reserved_env)
+            raise PydanticCustomError(
+                "machine_idle_release_s_must_be_non_negative",
+                "idle_release_s must be zero or greater",
             )
-        options = dict(self.sandbox_options)
-        reserved_options = sorted(_RESERVED_SANDBOX_OPTIONS & options.keys())
-        if reserved_options:
-            raise ConfigError(
-                "sandbox options are managed by modal-cursor: " + ", ".join(reserved_options)
-            )
-        object.__setattr__(self, "env", MappingProxyType(env))
-        object.__setattr__(self, "sandbox_options", MappingProxyType(options))
+        _reject_reserved(
+            self.env,
+            _RESERVED_WORKER_ENV,
+            "machine_env_contains_reserved_variable",
+            "env cannot override Cursor-managed variables",
+        )
+        _reject_reserved(
+            self.sandbox_options,
+            _RESERVED_SANDBOX_OPTIONS,
+            "machine_sandbox_options_contains_reserved_option",
+            "sandbox options are managed by modal-cursor",
+        )
+        return self
 
 
 class Claim(BaseSettings):
@@ -116,9 +174,11 @@ def _checkout_name(url: str) -> str:
 
 def build_entrypoint(pool_name: str, claim: Claim, default_repo_url: str | None) -> tuple[str, ...]:
     """Build the worker command, rejecting ambiguous repository destinations."""
-    urls = claim.repo_urls or ((claim.repo_url,) if claim.repo_url else ())
-    if not urls and default_repo_url:
-        urls = (default_repo_url,)
+    urls = (
+        claim.repo_urls
+        or ((claim.repo_url,) if claim.repo_url else ())
+        or ((default_repo_url,) if default_repo_url else ())
+    )
     destinations = [_checkout_name(url) for url in urls]
     duplicates = sorted({name for name in destinations if destinations.count(name) > 1})
     if duplicates:
@@ -147,18 +207,15 @@ def build_worker_env(machine: Machine, claim: Claim, api_key: str) -> dict[str, 
     """Build the exact environment exposed to the Cursor worker process."""
     if not api_key:
         raise ConfigError("CURSOR_API_KEY is required in the spawner secret")
-    values = dict(machine.env)
-    values.update(
-        CURSOR_AGENT_WORKER_ID=claim.agent_worker_id,
-        CURSOR_API_KEY=api_key,
-        CURSOR_POOL=claim.pool,
-        CURSOR_REQUEST_ID=claim.request_id,
-        CURSOR_WORKER_IDLE_RELEASE_TIMEOUT=str(machine.idle_release_s),
-    )
-    if claim.worker_name:
-        values["CURSOR_WORKER_NAME"] = claim.worker_name
-    if claim.repo_url:
-        values["CURSOR_REPO_URL"] = claim.repo_url
-    if claim.repo_urls:
-        values["CURSOR_REPO_URLS"] = json.dumps(claim.repo_urls)
+    values = {
+        **machine.env,
+        "CURSOR_AGENT_WORKER_ID": claim.agent_worker_id,
+        "CURSOR_API_KEY": api_key,
+        "CURSOR_POOL": claim.pool,
+        "CURSOR_REQUEST_ID": claim.request_id,
+        "CURSOR_WORKER_IDLE_RELEASE_TIMEOUT": str(machine.idle_release_s),
+        **({"CURSOR_WORKER_NAME": claim.worker_name} if claim.worker_name else {}),
+        **({"CURSOR_REPO_URL": claim.repo_url} if claim.repo_url else {}),
+        **({"CURSOR_REPO_URLS": json.dumps(claim.repo_urls)} if claim.repo_urls else {}),
+    }
     return values

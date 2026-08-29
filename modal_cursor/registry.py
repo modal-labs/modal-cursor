@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
 from typing import Literal, TypeAlias, cast
 from urllib.parse import quote, urlsplit
 
 import httpx
+from pydantic import BaseModel, ConfigDict, ValidationError, model_validator
 
 DEFAULT_API_ENDPOINT = "https://api.cursor.com"
 HTTP_NOT_FOUND = 404
@@ -20,9 +20,10 @@ class RegistrySchemaError(ValueError):
     """Cursor returned a successful response with an invalid pool schema."""
 
 
-@dataclass(frozen=True, slots=True)
-class Repository:
+class Repository(BaseModel):
     """GitHub repository identity required by Cursor's pool API."""
+
+    model_config = ConfigDict(frozen=True, strict=True)
 
     owner: str
     name: str
@@ -52,9 +53,10 @@ class Repository:
         return cls(owner=owner, name=name, url=f"https://github.com/{owner}/{name}")
 
 
-@dataclass(frozen=True, slots=True)
-class PoolRegistration:
+class PoolRegistration(BaseModel):
     """The complete identity Cursor needs to register one pool."""
+
+    model_config = ConfigDict(frozen=True, arbitrary_types_allowed=True)
 
     name: str
     scope: PoolScope
@@ -76,9 +78,10 @@ class PoolRegistration:
         return body
 
 
-@dataclass(frozen=True, slots=True)
-class RegisteredPool:
+class RegisteredPool(BaseModel):
     """Pool state returned by Cursor, including live worker counts."""
+
+    model_config = ConfigDict(extra="ignore", strict=True)
 
     name: str
     scope: PoolScope
@@ -87,49 +90,82 @@ class RegisteredPool:
     worker_ready_timeout_s: int
     repository: Repository | None = None
 
+    @model_validator(mode="before")
+    @classmethod
+    def from_wire_shape(cls, raw: object) -> object:
+        if not isinstance(raw, Mapping):
+            return raw
+        value: dict[str, object] = dict(cast(Mapping[str, object], raw))
+        aliases = ("repoOwner", "repoName", "repoUrl")
+        repository: tuple[object, ...] = tuple(value.pop(alias, None) for alias in aliases)
+        if any(item is not None for item in repository):
+            owner, name, url = repository
+            if not all(isinstance(item, str) and item for item in repository):
+                raise ValueError("Cursor repo-backed pool has incomplete repository metadata")
+            if not isinstance(owner, str) or not isinstance(name, str) or not isinstance(url, str):
+                raise ValueError("Cursor repo-backed pool has incomplete repository metadata")
+            value["repository"] = Repository(owner=owner, name=name, url=url)
+        for wire_name, model_name in (
+            ("poolName", "name"),
+            ("connectedWorkerCount", "connected_workers"),
+            ("inUseWorkerCount", "in_use_workers"),
+            ("workerReadyTimeoutSeconds", "worker_ready_timeout_s"),
+        ):
+            if wire_name in value:
+                value[model_name] = value.pop(wire_name)
+        return value
+
+    @model_validator(mode="after")
+    def validate_values(self) -> RegisteredPool:
+        if not self.name:
+            raise ValueError("Cursor pool entry has an invalid name or scope")
+        if any(
+            value < 0
+            for value in (self.connected_workers, self.in_use_workers, self.worker_ready_timeout_s)
+        ):
+            raise ValueError("Cursor pool entry has invalid worker counts or timeout")
+        return self
+
     @classmethod
     def from_payload(cls, value: object) -> RegisteredPool:
         if not isinstance(value, Mapping):
             raise RegistrySchemaError("Cursor pool entry is not an object")
         try:
-            name = value["poolName"]
-            scope = value["scope"]
-            connected = value["connectedWorkerCount"]
-            in_use = value["inUseWorkerCount"]
-            ready_timeout = value["workerReadyTimeoutSeconds"]
-        except KeyError as error:
-            raise RegistrySchemaError(f"Cursor pool entry is missing {error.args[0]!r}") from error
-        if not isinstance(name, str) or scope not in ("team", "user"):
-            raise RegistrySchemaError("Cursor pool entry has an invalid name or scope")
-        if not all(
-            isinstance(item, int) and item >= 0 for item in (connected, in_use, ready_timeout)
-        ):
-            raise RegistrySchemaError("Cursor pool entry has invalid worker counts or timeout")
-
-        repo_owner = value.get("repoOwner")
-        repo_name = value.get("repoName")
-        repo_url = value.get("repoUrl")
-        repository: Repository | None = None
-        if any(item is not None for item in (repo_owner, repo_name, repo_url)):
-            if not all(
-                isinstance(item, str) and item for item in (repo_owner, repo_name, repo_url)
-            ):
+            return cls.model_validate(value)
+        except ValidationError as error:
+            details = error.errors()[0]
+            if details["type"] == "missing":
+                location = details["loc"][0]
+                if not isinstance(location, str):
+                    location = str(location)
+                missing = {
+                    "name": "poolName",
+                    "scope": "scope",
+                    "connected_workers": "connectedWorkerCount",
+                    "in_use_workers": "inUseWorkerCount",
+                    "worker_ready_timeout_s": "workerReadyTimeoutSeconds",
+                }.get(location, location)
+                raise RegistrySchemaError(f"Cursor pool entry is missing {missing!r}") from error
+            if "invalid name or scope" in str(error) or details["loc"][:1] in {
+                ("name",),
+                ("scope",),
+            }:
+                raise RegistrySchemaError(
+                    "Cursor pool entry has an invalid name or scope"
+                ) from error
+            if "invalid worker counts or timeout" in str(error) or details["loc"][:1] in {
+                ("connected_workers",),
+                ("in_use_workers",),
+                ("worker_ready_timeout_s",),
+            }:
+                raise RegistrySchemaError(
+                    "Cursor pool entry has invalid worker counts or timeout"
+                ) from error
+            if "repo-backed" in str(error):
                 raise RegistrySchemaError(
                     "Cursor repo-backed pool has incomplete repository metadata"
-                )
-            repository = Repository(
-                owner=cast(str, repo_owner),
-                name=cast(str, repo_name),
-                url=cast(str, repo_url),
-            )
-        return cls(
-            name=name,
-            scope=cast(PoolScope, scope),
-            connected_workers=connected,
-            in_use_workers=in_use,
-            worker_ready_timeout_s=ready_timeout,
-            repository=repository,
-        )
+                ) from error
+            raise RegistrySchemaError(f"Cursor pool entry has invalid schema: {error}") from error
 
 
 def cursor_client(api_endpoint: str, token: str) -> httpx.Client:
@@ -145,10 +181,13 @@ def register_pool(client: httpx.Client, registration: PoolRegistration) -> None:
 def list_pools(client: httpx.Client) -> list[RegisteredPool]:
     response = client.get("/v0/private-workers/pools")
     response.raise_for_status()
-    payload = response.json()
-    if not isinstance(payload, Mapping) or not isinstance(payload.get("pools"), list):
+    payload: object = response.json()
+    if not isinstance(payload, Mapping):
         raise RegistrySchemaError("Cursor pool response is missing the 'pools' array")
-    return [RegisteredPool.from_payload(item) for item in payload["pools"]]
+    pools = cast(Mapping[str, object], payload).get("pools")
+    if not isinstance(pools, list):
+        raise RegistrySchemaError("Cursor pool response is missing the 'pools' array")
+    return [RegisteredPool.from_payload(item) for item in cast(list[object], pools)]
 
 
 def deregister_pool(client: httpx.Client, pool: RegisteredPool) -> None:
@@ -172,8 +211,12 @@ def worker_connected(client: httpx.Client, worker_id: str) -> bool:
     if response.status_code == HTTP_NOT_FOUND:
         return False
     response.raise_for_status()
-    payload = response.json()
-    worker = payload.get("worker") if isinstance(payload, Mapping) else None
-    if not isinstance(worker, Mapping) or worker.get("workerId") != worker_id:
+    payload: object = response.json()
+    if not isinstance(payload, Mapping):
+        raise RegistrySchemaError("Cursor worker response has an invalid workerId")
+    worker = cast(Mapping[str, object], payload).get("worker")
+    if not isinstance(worker, Mapping):
+        raise RegistrySchemaError("Cursor worker response has an invalid workerId")
+    if cast(Mapping[str, object], worker).get("workerId") != worker_id:
         raise RegistrySchemaError("Cursor worker response has an invalid workerId")
     return True

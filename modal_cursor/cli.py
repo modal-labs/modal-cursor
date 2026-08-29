@@ -6,14 +6,16 @@ import ast
 import os
 import subprocess
 import sys
+from collections.abc import Callable, Iterable
 from importlib.resources import files
 from pathlib import Path
 from string import Template
-from typing import Annotated, Literal
+from typing import Annotated, Literal, Protocol, cast
 
 import cyclopts
 import httpx
 import modal
+from pydantic import ValidationError
 from rich.console import Console
 from rich.prompt import Confirm, Prompt
 
@@ -55,6 +57,20 @@ YesOption = Annotated[bool, cyclopts.Parameter(name=("--yes", "-y"), negative=Fa
 _console = Console(highlight=False, markup=False)
 
 
+class _ModalFunction(Protocol):
+    def spawn(self) -> object: ...
+
+    def get_current_stats(self) -> _ModalStats: ...
+
+
+class _ModalStats(Protocol):
+    num_total_runners: int
+
+
+class _NamedSecret(Protocol):
+    name: str
+
+
 def _ok(text: str) -> None:
     _console.print(f"✓ {text}", style="green")
 
@@ -81,10 +97,10 @@ def _confirm(question: str, *, default: bool = False) -> bool:
     return bool(Confirm.ask(question, console=_console, default=default))
 
 
-def _modal(*args: str) -> subprocess.CompletedProcess[str]:
+def _modal(*args: str, capture_output: bool = True) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [sys.executable, "-m", "modal", *args],
-        capture_output=True,
+        capture_output=capture_output,
         text=True,
         timeout=30,
         check=False,
@@ -100,21 +116,13 @@ def _modal_is_configured() -> bool:
 
 def _secret_names() -> set[str]:
     """Return configured Modal secret names behind one mockable SDK boundary."""
-    return {secret.name for secret in modal.Secret.objects.list() if secret.name}
+    secrets = cast(Iterable[_NamedSecret], modal.Secret.objects.list())
+    return {secret.name for secret in secrets if secret.name}
 
 
 def _modal_deploy(pool_file: Path) -> int:
-    return subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "modal",
-            "deploy",
-            "--strategy",
-            "rolling",
-            str(pool_file),
-        ],
-        check=False,
+    return _modal(
+        "deploy", "--strategy", "rolling", str(pool_file), capture_output=False
     ).returncode
 
 
@@ -127,8 +135,8 @@ def _pool_files(pool_file: Path | None, pools_dir: Path) -> list[Path]:
 
 def _pool_from_file(file: Path, *, scope: PoolScope = "team") -> Pool:
     try:
-        return Pool(file.stem, scope=scope)
-    except ConfigError as error:
+        return Pool(name=file.stem, scope=scope)
+    except (ConfigError, ValidationError) as error:
         raise SystemExit(
             f"{file} is not a valid pool file name (expected a slug like gpu-training.py)"
         ) from error
@@ -142,26 +150,29 @@ def _required_secrets(pool_file: Path) -> set[str]:
         raise ConfigError(f"cannot inspect {pool_file}: {error}") from error
     values: dict[str, object] = {}
     for node in tree.body:
-        if (
-            isinstance(node, ast.Assign)
-            and len(node.targets) == 1
-            and isinstance(node.targets[0], ast.Name)
-        ):
-            name = node.targets[0].id
-            if name in {"CURSOR_SECRET_NAME", "WORKER_SECRET_NAMES"}:
-                try:
-                    values[name] = ast.literal_eval(node.value)
-                except (TypeError, ValueError, SyntaxError) as error:
-                    raise ConfigError(f"{pool_file}: {name} must be a literal") from error
+        if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+            continue
+        target = node.targets[0]
+        if not isinstance(target, ast.Name) or target.id not in {
+            "CURSOR_SECRET_NAME",
+            "WORKER_SECRET_NAMES",
+        }:
+            continue
+        try:
+            values[target.id] = ast.literal_eval(node.value)
+        except (TypeError, ValueError, SyntaxError) as error:
+            raise ConfigError(f"{pool_file}: {target.id} must be a literal") from error
     cursor_secret = values.get("CURSOR_SECRET_NAME")
     worker_secrets = values.get("WORKER_SECRET_NAMES", ())
     if not isinstance(cursor_secret, str) or not cursor_secret:
         raise ConfigError(f"{pool_file}: CURSOR_SECRET_NAME is missing")
-    if not isinstance(worker_secrets, (tuple, list)) or not all(
-        isinstance(name, str) and name for name in worker_secrets
-    ):
+    if not isinstance(worker_secrets, (tuple, list)):
         raise ConfigError(f"{pool_file}: WORKER_SECRET_NAMES must be a sequence of names")
-    return {cursor_secret, *worker_secrets}
+    raw_names = tuple(cast(Iterable[object], worker_secrets))
+    names = tuple(name for name in raw_names if isinstance(name, str))
+    if len(names) != len(raw_names) or not all(names):
+        raise ConfigError(f"{pool_file}: WORKER_SECRET_NAMES must be a sequence of names")
+    return {cursor_secret, *names}
 
 
 def _deploy_and_start(file: Path, pool: Pool) -> bool:
@@ -170,7 +181,8 @@ def _deploy_and_start(file: Path, pool: Pool) -> bool:
         _error(f"{file} failed to deploy")
         return False
     try:
-        modal.Function.from_name(pool.app_name, "controller").spawn()
+        from_name = cast(Callable[[str, str], _ModalFunction], modal.Function.from_name)
+        from_name(pool.app_name, "controller").spawn()
     except modal.exception.Error as error:
         _error(f"Deployed {file}, but the controller failed to start: {error}")
         return False
@@ -266,7 +278,8 @@ def _check_local_pool(pool_file: Path, pool: Pool, secret_names: set[str]) -> in
         _ok(f"{pool_file} has all required Modal secrets")
     try:
         modal.App.lookup(pool.app_name, create_if_missing=False)
-        stats = modal.Function.from_name(pool.app_name, "controller").get_current_stats()
+        from_name = cast(Callable[[str, str], _ModalFunction], modal.Function.from_name)
+        stats = from_name(pool.app_name, "controller").get_current_stats()
     except modal.exception.NotFoundError:
         _error(f"{pool_file} has no deployed controller")
         return failures + 1
@@ -287,12 +300,15 @@ def _check_registry(
 ) -> int:
     failures = 0
     local_names = {pool.name for _, pool in local_pools}
-    registered_names = {item.name for item in registry if item.scope == scope}
-    for name in sorted(registered_names - local_names):
+    by_name: dict[str, list[RegisteredPool]] = {}
+    for item in registry:
+        if item.scope == scope:
+            by_name.setdefault(item.name, []).append(item)
+    for name in sorted(by_name.keys() - local_names):
         _error(f"Cursor pool {name} is registered but has no local pool file")
         failures += 1
     for pool_file, pool in local_pools:
-        matches = [item for item in registry if item.scope == scope and item.name == pool.name]
+        matches = by_name.get(pool.name, [])
         if not matches:
             _error(f"{pool_file} is not registered with Cursor")
             failures += 1
@@ -417,25 +433,32 @@ def init_pool(  # noqa: PLR0912 - one linear CLI workflow with explicit user dec
 
     try:
         pool = Pool(
-            name,
+            name=name,
             repo_url=repo_url or None,
             scope=scope,
             worker_ready_timeout_s=worker_ready_timeout_s,
             api_endpoint=api_endpoint,
         )
-    except ConfigError as error:
+    except (ConfigError, ValidationError) as error:
         raise SystemExit(str(error)) from error
 
     out_path = pools_dir / f"{pool.name}.py"
     if out_path.exists():
         raise SystemExit(f"{out_path} already exists, not overwriting")
     worker_secret_names = (github_secret_name,) if private_repo else ()
+    pool_options = "".join(
+        f", {name}={value!r}"
+        for name, value, default in (
+            ("repo_url", pool.repo_url, None),
+            ("scope", pool.scope, "team"),
+            ("worker_ready_timeout_s", pool.worker_ready_timeout_s, 0),
+            ("api_endpoint", pool.api_endpoint, DEFAULT_API_ENDPOINT),
+        )
+        if value != default
+    )
     generated = Template(TEMPLATE.read_text(encoding="utf-8")).substitute(
         pool_name=repr(pool.name),
-        repo_url=repr(pool.repo_url),
-        scope=repr(pool.scope),
-        worker_ready_timeout_s=repr(pool.worker_ready_timeout_s),
-        api_endpoint=repr(pool.api_endpoint),
+        pool_options=pool_options,
         app_name=repr(pool.app_name),
         secret_name=repr(secret_name),
         worker_secret_names=repr(worker_secret_names),
@@ -448,7 +471,7 @@ def init_pool(  # noqa: PLR0912 - one linear CLI workflow with explicit user dec
     _ok(f"Wrote {out_path}")
 
     try:
-        existing_secrets = _secret_names()
+        existing_secrets: set[str] = _secret_names()
     except modal.exception.Error as error:
         _warn(f"Could not inspect Modal secrets: {error}")
         existing_secrets = set()
@@ -498,7 +521,7 @@ def doctor(
         failures += 1
 
     try:
-        secret_names = _secret_names()
+        secret_names: set[str] = _secret_names()
     except modal.exception.Error as error:
         _error(f"Could not inspect Modal secrets: {error}")
         secret_names = set()

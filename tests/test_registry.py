@@ -75,7 +75,9 @@ def test_list_pools_returns_typed_live_state() -> None:
         [pool] = list_pools(client)
     assert pool.connected_workers == 2
     assert pool.worker_ready_timeout_s == 900
-    assert pool.repository == Repository("acme", "payments", "https://github.com/acme/payments")
+    assert pool.repository == Repository(
+        owner="acme", name="payments", url="https://github.com/acme/payments"
+    )
 
 
 def test_deregister_repo_pool_includes_repository_identity() -> None:

@@ -5,8 +5,8 @@ from __future__ import annotations
 import os
 import sys
 import time
-from collections.abc import Mapping
-from typing import TYPE_CHECKING, Any, cast
+from collections.abc import Callable, Mapping
+from typing import TYPE_CHECKING, Protocol, cast
 
 import httpx
 from pydantic import ValidationError
@@ -16,6 +16,7 @@ from modal_cursor.pools import (
     Claim,
     ConfigError,
     Machine,
+    RuntimeSettings,
     build_entrypoint,
     build_worker_env,
 )
@@ -32,8 +33,10 @@ if TYPE_CHECKING:
     from modal_cursor.pool import Pool
 
 SPAWNER_NAME = "spawner"
-WORKER_READY_TIMEOUT_S = 120
-WORKER_POLL_INTERVAL_S = 1.0
+
+
+class _ModalSpawner(Protocol):
+    def remote(self, claim_payload: dict[str, object]) -> str: ...
 
 
 class WorkerProvisioningError(RuntimeError):
@@ -45,9 +48,11 @@ def _wait_for_worker_ready(
     client: httpx.Client,
     worker_id: str,
     *,
-    timeout_s: float = WORKER_READY_TIMEOUT_S,
+    timeout_s: float | None = None,
 ) -> None:
     """Wait until Cursor sees the worker, failing on early sandbox exit or timeout."""
+    settings = RuntimeSettings()
+    timeout_s = settings.spawner_ready_timeout_s if timeout_s is None else timeout_s
     deadline = time.monotonic() + timeout_s
     while True:
         returncode = sandbox.poll()
@@ -63,7 +68,7 @@ def _wait_for_worker_ready(
             raise WorkerProvisioningError(
                 f"sandbox {sandbox.object_id} did not connect worker within {timeout_s:g}s"
             )
-        time.sleep(WORKER_POLL_INTERVAL_S)
+        time.sleep(settings.worker_poll_interval_s)
 
 
 def spawn_worker(
@@ -77,8 +82,9 @@ def spawn_worker(
         raise ConfigError(f"claim for pool {claim.pool!r} reached spawner for {pool.name!r}")
     api_key = os.environ.get("CURSOR_API_KEY", "")
     worker_env = cast(dict[str, str | None], build_worker_env(worker, claim, api_key))
-    sandbox_options = cast(dict[str, Any], dict(worker.sandbox_options))
-    sandbox = modal.Sandbox.create(
+    sandbox_options: dict[str, object] = dict(worker.sandbox_options)
+    create = cast(Callable[..., modal.Sandbox], modal.Sandbox.create)
+    sandbox = create(
         *build_entrypoint(pool.name, claim, pool.repo_url),
         image=worker.image,
         secrets=worker.secrets,
@@ -113,7 +119,7 @@ def main() -> int:
     import modal
 
     try:
-        claim = Claim()
+        claim = Claim()  # pyright: ignore[reportCallIssue]
     except ValidationError as error:
         print(f"[spawn] error: invalid claim env: {error}", file=sys.stderr)
         return 2
@@ -128,7 +134,8 @@ def main() -> int:
         return 2
 
     try:
-        spawner = modal.Function.from_name(app_name, SPAWNER_NAME)
+        from_name = cast(Callable[[str, str], _ModalSpawner], modal.Function.from_name)
+        spawner = from_name(app_name, SPAWNER_NAME)
         sandbox_id = spawner.remote(claim.payload())
     except modal.exception.Error as error:
         release_error = _release_failed_claim(claim, api_key)
