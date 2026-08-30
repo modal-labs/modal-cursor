@@ -64,12 +64,22 @@ class _Dispatcher:
             if request.request_id in self._inflight:
                 return
             self._inflight.add(request.request_id)
-        # Dispatch runs asynchronously from the Cursor polling/SSE loop. Carry
-        # the discovery context as a link rather than a parent so the job trace
-        # remains visible and self-contained after the loop continues.
-        carrier: dict[str, str] = {}
-        inject_trace_context(carrier)
-        self._executor.submit(self._dispatch, request, claim_exists, carrier)
+        with span(
+            "modal_cursor.controller.discover",
+            **{
+                "modal_cursor.pool.name": request.pool,
+                "modal_cursor.request.id": request.request_id,
+                "cursor.conversation.id": request.request_id,
+                "modal_cursor.discovery.claim_exists": claim_exists,
+            },
+        ):
+            # Dispatch runs asynchronously from the Cursor polling/SSE loop.
+            # Carry the bounded discovery context as a link rather than a
+            # parent so the job trace remains visible and self-contained after
+            # the loop continues.
+            carrier: dict[str, str] = {}
+            inject_trace_context(carrier)
+            self._executor.submit(self._dispatch, request, claim_exists, carrier)
 
     def close(self) -> None:
         self._executor.shutdown(wait=True)

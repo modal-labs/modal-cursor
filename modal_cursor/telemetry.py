@@ -165,15 +165,20 @@ def new_root_span(
     except (AttributeError, TypeError, ValueError):
         pass
 
-    token = context.attach(Context())
-    try:
-        links: tuple[tuple[Any, dict[str, str]], ...] = ()
-        if linked_span_context is not None:
-            links = ((linked_span_context, {"modal_cursor.link.type": "controller_startup"}),)
-        with span(name, _links=links, **attributes) as current:
-            yield current
-    finally:
-        context.detach(token)
+    # Logfire warns when it sees a deliberately extracted context. This helper
+    # uses that context only to create an explicit span link, so suppress the
+    # otherwise noisy distributed-tracing warning locally.
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        token = context.attach(Context())
+        try:
+            links: tuple[tuple[Any, dict[str, str]], ...] = ()
+            if linked_span_context is not None:
+                links = ((linked_span_context, {"modal_cursor.link.type": "controller_startup"}),)
+            with span(name, _links=links, **attributes) as current:
+                yield current
+        finally:
+            context.detach(token)
 
 
 def flush_telemetry(timeout_millis: int = 10_000) -> bool:
