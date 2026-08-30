@@ -57,7 +57,7 @@ def test_new_root_span_does_not_reuse_controller_trace(capfire: CaptureLogfire) 
 
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", RuntimeWarning)
-        with new_root_span(carrier, "modal_cursor.test.dispatch"):
+        with continue_trace(carrier), new_root_span(carrier, "modal_cursor.test.dispatch"):
             pass
 
     spans = [
