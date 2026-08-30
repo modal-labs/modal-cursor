@@ -5,6 +5,7 @@ from unittest.mock import Mock
 
 import modal
 import pytest
+from logfire.testing import CaptureLogfire
 
 from modal_cursor import Pool
 from modal_cursor import spawn as spawn_module
@@ -63,6 +64,27 @@ def test_worker_readiness_detects_early_exit_and_timeout(
     with pytest.raises(spawn_module.WorkerProvisioningError, match="did not connect"):
         spawn_module._wait_for_worker_ready(timed_out, Mock(), "pw-1", timeout_s=0)
     timed_out.terminate.assert_called_once_with()
+
+
+def test_worker_readiness_records_semantic_poll_spans(
+    monkeypatch: pytest.MonkeyPatch, capfire: CaptureLogfire
+) -> None:
+    sandbox = SimpleNamespace(object_id="sb-ready", poll=Mock(return_value=None))
+    monkeypatch.setattr(spawn_module, "worker_connected", Mock(side_effect=[False, True]))
+    monkeypatch.setattr(spawn_module.time, "sleep", Mock())
+
+    spawn_module._wait_for_worker_ready(sandbox, Mock(), "pw-ready")
+
+    exported = [
+        item
+        for item in capfire.exporter.exported_spans
+        if item.attributes.get("logfire.span_type") == "span"
+    ]
+    polls = [item for item in exported if item.name == "modal_cursor.worker.readiness.poll"]
+    assert [item.attributes["modal_cursor.worker.poll.outcome"] for item in polls] == [
+        "not_ready",
+        "ready",
+    ]
 
 
 def test_spawn_worker_rejects_cross_pool_claim() -> None:

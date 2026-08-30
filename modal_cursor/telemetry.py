@@ -100,6 +100,19 @@ def set_attribute(current: Any, name: str, value: object) -> None:
         return
 
 
+def add_event(current: Any, name: str, attributes: Mapping[str, object] | None = None) -> None:
+    """Add a structured lifecycle event without making application work depend on telemetry."""
+    if current is None:
+        return
+    try:
+        current.add_event(
+            name,
+            attributes=None if attributes is None else cast(dict[str, Any], dict(attributes)),
+        )
+    except (AttributeError, TypeError, ValueError):
+        return
+
+
 def current_span() -> Any:
     """Return the active span for decorator-instrumented operations."""
     return trace.get_current_span()

@@ -27,6 +27,7 @@ from modal_cursor.registry import (
     worker_connected,
 )
 from modal_cursor.telemetry import (
+    add_event,
     continue_trace,
     current_span,
     flush_at_exit,
@@ -69,19 +70,75 @@ def _wait_for_worker_ready(
     timeout_s = settings.spawner_ready_timeout_s if timeout_s is None else timeout_s
     set_attribute(current, "modal_cursor.worker.ready_timeout_s", timeout_s)
     deadline = time.monotonic() + timeout_s
+    started_at = time.monotonic()
+    attempt = 0
+    process_alive_recorded = False
+    registration_pending_recorded = False
     while True:
+        attempt += 1
         returncode = sandbox.poll()
         if returncode is not None:
+            add_event(
+                current,
+                "modal_cursor.worker.process_exited",
+                {"modal_cursor.worker.poll.attempt": attempt, "process.exit.code": returncode},
+            )
             raise WorkerProvisioningError(
                 f"sandbox {sandbox.object_id} exited with status {returncode} "
                 "before worker connected"
             )
-        if worker_connected(client, worker_id):
+        if not process_alive_recorded:
+            process_alive_recorded = True
+            add_event(
+                current,
+                "modal_cursor.worker.sandbox_process_alive",
+                {
+                    "modal_cursor.worker.poll.attempt": attempt,
+                    "modal_cursor.worker.elapsed_ms": round((time.monotonic() - started_at) * 1000),
+                },
+            )
+        with span(
+            "modal_cursor.worker.readiness.poll",
+            **{"modal_cursor.worker.poll.attempt": attempt},
+        ) as poll_span:
+            ready = worker_connected(client, worker_id)
+            set_attribute(poll_span, "modal_cursor.worker.ready", ready)
+            set_attribute(
+                poll_span,
+                "modal_cursor.worker.poll.outcome",
+                "ready" if ready else "not_ready",
+            )
+        if ready:
             set_attribute(current, "modal_cursor.worker.ready", True)
+            set_attribute(current, "modal_cursor.worker.poll.count", attempt)
+            add_event(
+                current,
+                "modal_cursor.worker.registration_succeeded",
+                {
+                    "modal_cursor.worker.poll.attempt": attempt,
+                    "modal_cursor.worker.elapsed_ms": round((time.monotonic() - started_at) * 1000),
+                },
+            )
             return
+        if not registration_pending_recorded:
+            registration_pending_recorded = True
+            add_event(
+                current,
+                "modal_cursor.worker.registration_pending",
+                {"modal_cursor.worker.poll.attempt": attempt},
+            )
         if time.monotonic() >= deadline:
             sandbox.terminate()
             set_attribute(current, "modal_cursor.worker.ready", False)
+            set_attribute(current, "modal_cursor.worker.poll.count", attempt)
+            add_event(
+                current,
+                "modal_cursor.worker.registration_timeout",
+                {
+                    "modal_cursor.worker.poll.attempt": attempt,
+                    "modal_cursor.worker.elapsed_ms": round((time.monotonic() - started_at) * 1000),
+                },
+            )
             raise WorkerProvisioningError(
                 f"sandbox {sandbox.object_id} did not connect worker within {timeout_s:g}s"
             )
@@ -204,8 +261,21 @@ def main() -> int:
             ) as invoke_span:
                 trace_carrier: dict[str, str] = {}
                 inject_trace_context(trace_carrier)
+                add_event(invoke_span, "modal_cursor.modal.remote_call_dispatched")
+                remote_started_at = time.monotonic()
                 sandbox_id = spawner.remote(claim.payload(), trace_carrier)
                 set_attribute(invoke_span, "modal_cursor.sandbox.id", sandbox_id)
+                remote_elapsed_ms = round((time.monotonic() - remote_started_at) * 1000)
+                set_attribute(
+                    invoke_span,
+                    "modal_cursor.modal.remote_call.elapsed_ms",
+                    remote_elapsed_ms,
+                )
+                add_event(
+                    invoke_span,
+                    "modal_cursor.modal.remote_call_completed",
+                    {"modal_cursor.modal.remote_call.elapsed_ms": remote_elapsed_ms},
+                )
         except modal.exception.Error as error:
             record_exception(current, error)
             release_error = _release_failed_claim(claim, api_key)

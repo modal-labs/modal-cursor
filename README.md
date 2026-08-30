@@ -108,8 +108,10 @@ modal_cursor.controller.invocation
          └─ modal_cursor.worker.provision
             ├─ modal_cursor.worker.create_sandbox
             └─ modal_cursor.worker.wait_for_ready
-               ├─ GET 404                         # not visible to Cursor yet
-               └─ GET 200                         # worker connected
+               ├─ modal_cursor.worker.readiness.poll # attempt=1, not_ready
+               │  └─ GET 404                       # not visible to Cursor yet
+               └─ modal_cursor.worker.readiness.poll # attempt=2, ready
+                  └─ GET 200                     # worker connected
 ```
 
 Cursor's controller is a closed-source subprocess, so queue discovery and the
@@ -122,6 +124,11 @@ started outside the long-lived `process.wait()` call: OpenTelemetry exports
 spans when they end, so keeping `controller.invocation` or `controller.run`
 open for the controller's entire lifetime would hide the parent spans and make
 the trace appear unstructured until shutdown.
+Readiness spans also emit lifecycle events for the first observed live sandbox
+process, pending registration, successful registration, process exit, and
+timeout. The Modal remote-call span records dispatch and completion events so
+the interval before the spawner function begins is visible as remote invocation
+startup/scheduling time rather than an unexplained missing operation.
 
 ## Operations
 
