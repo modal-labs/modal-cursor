@@ -4,14 +4,18 @@ import httpx
 import pytest
 
 from modal_cursor.registry import (
+    PendingRequest,
     PoolRegistration,
     RegisteredPool,
     RegistrySchemaError,
     Repository,
+    claim_pending_request,
     deregister_pool,
+    list_pending_requests,
     list_pools,
     register_pool,
     release_claim,
+    watch_pending_requests,
     worker_connected,
 )
 
@@ -78,6 +82,77 @@ def test_list_pools_returns_typed_live_state() -> None:
     assert pool.repository == Repository(
         owner="acme", name="payments", url="https://github.com/acme/payments"
     )
+
+
+def _pending_payload(request_id: str = "bc-1", pool: str = "payments") -> dict[str, object]:
+    return {
+        "id": request_id,
+        "labels": [{"key": "pool", "value": pool}],
+        "repoUrl": "https://github.com/acme/payments",
+    }
+
+
+def test_pending_request_routes_by_pool_and_keeps_claim_payload_secret_free() -> None:
+    request = PendingRequest.from_payload(_pending_payload())
+    assert request.pool == "payments"
+    assert request.claim_payload("worker-1") == {
+        "agent_worker_id": "worker-1",
+        "pool": "payments",
+        "request_id": "bc-1",
+        "worker_name": None,
+        "repo_url": "https://github.com/acme/payments",
+        "repo_urls": (),
+    }
+
+
+def test_pending_request_list_is_unfiltered_and_sse_is_cursor_based() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path.endswith("/stream"):
+            body = (
+                "id: cursor-2\n"
+                "event: created\n"
+                f"data: {__import__('json').dumps(_pending_payload())}\n\n"
+                "id: cursor-3\n"
+                "event: heartbeat\n"
+                "data: {}\n\n"
+            )
+            return httpx.Response(200, text=body, headers={"content-type": "text/event-stream"})
+        return httpx.Response(
+            200,
+            json={"requests": [_pending_payload()], "streamCursor": "cursor-1"},
+        )
+
+    with _client(handler) as client:
+        pending, cursor = list_pending_requests(client)
+        events = list(watch_pending_requests(client, cursor))
+
+    assert pending[0].request_id == "bc-1"
+    assert cursor == "cursor-1"
+    assert events[0].event == "created"
+    assert events[0].request is not None
+    assert events[1].event == "heartbeat"
+    assert events[1].request is None
+    assert requests[0].url.params == httpx.QueryParams()
+    assert requests[1].url.params["cursor"] == "cursor-1"
+
+
+def test_claim_pending_request_uses_cursor_claim_contract() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json={"claimed": True})
+
+    with _client(handler) as client:
+        claim_pending_request(client, "bc-1", "worker-1")
+
+    assert __import__("json").loads(requests[0].content) == {
+        "id": "bc-1",
+        "workerId": "worker-1",
+    }
 
 
 def test_deregister_repo_pool_includes_repository_identity() -> None:

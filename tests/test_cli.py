@@ -42,9 +42,7 @@ def _registry_payload(name: str = "demo-pool", *, connected: int = 0) -> dict[st
     }
 
 
-def test_init_generates_owned_single_pool_app(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_init_generates_pool_configuration(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     generated = _init(
         tmp_path,
         monkeypatch,
@@ -54,15 +52,15 @@ def test_init_generates_owned_single_pool_app(
     namespace = runpy.run_path(str(generated))
     source = generated.read_text()
 
-    assert "pool.register()" in source
-    assert "modal_cursor.controller.invocation" in source
-    assert "spawn_worker(pool, worker, app, claim_env, trace_carrier)" in source
-    assert "settings.controller_max_retries" in source
+    assert "pool.register()" not in source
+    assert "SpawnServer(" not in source
+    assert "spawn_worker(" not in source
+    assert "app =" not in source
     assert namespace["pool"].worker_ready_timeout_s == 900
     assert namespace["CURSOR_SECRET_NAME"] == "cursor-service-account"
     assert namespace["LOGFIRE_SECRET_NAME"] == "logfire-token"
     assert namespace["WORKER_SECRET_NAMES"] == ()
-    assert namespace["app"].name == "modal-cursor-demo-pool"
+    assert namespace["worker"].image is not None
 
 
 def test_private_repo_configures_github_secret(
@@ -99,17 +97,21 @@ def test_init_refuses_to_overwrite(tmp_path: Path, monkeypatch: pytest.MonkeyPat
         _init(tmp_path, monkeypatch)
 
 
-def test_deploy_starts_controller(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_deploy_starts_single_control_plane(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     _init(tmp_path, monkeypatch)
-    monkeypatch.setattr(cli, "_modal_deploy", lambda file: 0)
+    deployed: list[list[Path]] = []
+    monkeypatch.setattr(cli, "_modal_deploy", lambda files: deployed.append(list(files)) or 0)
     controller = Mock()
     from_name = Mock(return_value=controller)
     monkeypatch.setattr(cli.modal.Function, "from_name", from_name)
 
     cli.deploy(pools_dir=tmp_path)
 
-    from_name.assert_called_once_with("modal-cursor-demo-pool", "controller")
+    from_name.assert_called_once_with(cli.CONTROL_PLANE_APP_NAME, "controller")
     controller.spawn.assert_called_once_with()
+    assert deployed == [[tmp_path / "demo-pool.py"]]
 
 
 def test_subprocess_boundaries_and_configuration_probe(
@@ -127,6 +129,7 @@ def test_subprocess_boundaries_and_configuration_probe(
         "timeout": 30,
         "check": False,
     }
+    assert cli.POOL_FILES_ENV in run.call_args_list[1].kwargs["env"]
 
     monkeypatch.setattr(cli, "_modal", Mock(side_effect=subprocess.TimeoutExpired("modal", 30)))
     assert not cli._modal_is_configured()
@@ -159,27 +162,24 @@ def test_pool_file_and_secret_validation(tmp_path: Path) -> None:
         cli._required_secrets(malformed)
 
 
-def test_deploy_reports_each_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_deploy_rejects_invalid_pool_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     good = tmp_path / "good.py"
     bad = tmp_path / "Bad_Name.py"
     good.touch()
     bad.touch()
-    monkeypatch.setattr(cli, "_modal_deploy", lambda file: 1)
-
-    with pytest.raises(SystemExit, match=r"2 of 2 pool\(s\) failed"):
+    with pytest.raises(SystemExit, match="not a valid pool file name"):
         cli.deploy(pools_dir=tmp_path)
 
 
-def test_stop_modal_app_handles_absence_sdk_and_cli_failures(
+def test_stop_control_plane_handles_absence_sdk_and_cli_failures(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    pool = Pool(name="gpu")
     lookup = Mock(side_effect=modal.exception.NotFoundError("missing"))
     monkeypatch.setattr(cli.modal.App, "lookup", lookup)
-    assert cli._stop_modal_app(pool)
+    assert cli._stop_control_plane_app()
 
     lookup.side_effect = modal.exception.RemoteError("unavailable")
-    assert not cli._stop_modal_app(pool)
+    assert not cli._stop_control_plane_app()
 
     lookup.side_effect = None
     lookup.return_value = object()
@@ -188,14 +188,14 @@ def test_stop_modal_app_handles_absence_sdk_and_cli_failures(
         "_modal",
         lambda *args: subprocess.CompletedProcess(args, 1, "", "stop failed"),
     )
-    assert not cli._stop_modal_app(pool)
+    assert not cli._stop_control_plane_app()
 
     monkeypatch.setattr(
         cli,
         "_modal",
         lambda *args: subprocess.CompletedProcess(args, 0, "", ""),
     )
-    assert cli._stop_modal_app(pool)
+    assert cli._stop_control_plane_app()
 
 
 def test_deregister_matches_handles_absent_and_failed_records() -> None:

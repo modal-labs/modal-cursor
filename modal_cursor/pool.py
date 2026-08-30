@@ -4,9 +4,7 @@ from __future__ import annotations
 
 import os
 import re
-import subprocess
 from collections.abc import Mapping, Sequence
-from pathlib import Path
 from typing import Literal
 
 import modal
@@ -14,8 +12,6 @@ from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 from pydantic_core import PydanticCustomError
 
 from modal_cursor.pools import (
-    APP_NAME_ENV,
-    CURSOR_AGENT_PATH,
     Machine,
     RuntimeSettings,
 )
@@ -26,11 +22,9 @@ from modal_cursor.registry import (
     cursor_client,
     register_pool,
 )
-from modal_cursor.telemetry import current_span, inject_trace_context, instrument, set_attribute
+from modal_cursor.telemetry import current_span, instrument, set_attribute
 
 MAX_NAME_LENGTH = 50  # "modal-cursor-" + 50 characters fits Modal's 64-char cap.
-SPAWN_BRIDGE_PATH = "/usr/local/bin/modal-cursor-spawn"
-
 _CURSOR_CLI_RELEASE = "2026.08.28-8fddf07"
 _CURSOR_CLI_URL = (
     f"https://downloads.cursor.com/lab/{_CURSOR_CLI_RELEASE}/linux/x64/agent-cli-package.tar.gz"
@@ -43,7 +37,6 @@ _CONTROLLER_DEPENDENCIES = (
     "pydantic-settings==2.15.0",
 )
 _POOL_NAME_RE = re.compile(r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?")
-_BRIDGE_SOURCE = Path(__file__).with_name("_spawn_bridge.py")
 
 
 def _cursor_cli_image(*extra_apt: str) -> modal.Image:
@@ -125,14 +118,12 @@ class Pool(BaseModel):
             repository=repository,
         )
 
-    def controller_image(self) -> modal.Image:
-        """Cursor CLI plus the exact dependencies and executable spawn bridge."""
+    def control_plane_image(self) -> modal.Image:
+        """Build the lightweight image used by the all-pools control plane."""
         return (
-            _cursor_cli_image()
+            modal.Image.debian_slim()
             .uv_pip_install(*_CONTROLLER_DEPENDENCIES)
             .add_local_python_source("modal_cursor", copy=True)
-            .add_local_file(_BRIDGE_SOURCE, SPAWN_BRIDGE_PATH, copy=True)
-            .run_commands(f"chmod 755 {SPAWN_BRIDGE_PATH}")
         )
 
     def worker_image(self) -> modal.Image:
@@ -172,33 +163,3 @@ class Pool(BaseModel):
         endpoint = os.environ.get("CURSOR_API_ENDPOINT", self.api_endpoint)
         with cursor_client(endpoint, os.environ["CURSOR_API_KEY"]) as client:
             register_pool(client, self.registration)
-
-    @instrument("modal_cursor.controller.run")
-    def start_controller(self) -> subprocess.Popen[bytes]:
-        """Start Cursor's controller and return before its long-lived process ends."""
-        current = current_span()
-        set_attribute(current, "modal_cursor.pool.name", self.name)
-        set_attribute(current, "modal_cursor.app.name", self.app_name)
-        env = {**os.environ, APP_NAME_ENV: self.app_name}
-        inject_trace_context(env)
-        process = subprocess.Popen(
-            [
-                CURSOR_AGENT_PATH,
-                "worker",
-                "controller",
-                "--spawn",
-                SPAWN_BRIDGE_PATH,
-                "--pool",
-                self.name,
-            ],
-            env=env,
-        )
-        set_attribute(current, "process.pid", process.pid)
-        return process
-
-    def run_controller(self) -> None:
-        """Run Cursor's controller, waiting after its startup span is exported."""
-        process = self.start_controller()
-        returncode = process.wait()
-        if returncode:
-            raise subprocess.CalledProcessError(returncode, process.args)

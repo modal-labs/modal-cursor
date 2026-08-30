@@ -26,8 +26,6 @@ MAX_REPOSITORIES = 20
 WORKSPACE = "/workspace"
 CURSOR_AGENT_PATH = "/root/.local/bin/agent"
 
-APP_NAME_ENV = "MODAL_CURSOR_APP_NAME"
-
 _RESERVED_WORKER_ENV = {
     "CURSOR_AGENT_WORKER_ID",
     "CURSOR_API_KEY",
@@ -160,7 +158,7 @@ class Claim(BaseSettings):
         return urls
 
     def payload(self) -> dict[str, object]:
-        """Serialize only non-secret fields for the deployed Modal spawner."""
+        """Serialize only non-secret fields for controller-owned provisioning."""
         return self.model_dump()
 
 
@@ -206,7 +204,7 @@ def build_entrypoint(pool_name: str, claim: Claim, default_repo_url: str | None)
 def build_worker_env(machine: Machine, claim: Claim, api_key: str) -> dict[str, str]:
     """Build the exact environment exposed to the Cursor worker process."""
     if not api_key:
-        raise ConfigError("CURSOR_API_KEY is required in the spawner secret")
+        raise ConfigError("CURSOR_API_KEY is required in the controller secret")
     values = {
         **machine.env,
         "CURSOR_AGENT_WORKER_ID": claim.agent_worker_id,

@@ -1,8 +1,8 @@
 # modal-cursor
 
-Run Cursor bring-your-own-machine worker pools on Modal. Each generated Modal
-application owns one durable Cursor pool, one long-running controller, and one
-function that provisions an isolated sandbox for each claimed request.
+Run Cursor bring-your-own-machine worker pools on Modal. One durable Modal
+control-plane controller owns registration and dispatch for every configured
+Cursor pool, then creates an isolated sandbox for each claimed request.
 
 This project targets Python 3.11 and newer.
 
@@ -17,8 +17,9 @@ uv run modal-cursor deploy
 uv run modal-cursor doctor
 ```
 
-`init` writes an editable `pools/gpu-training.py`. Customize its worker image,
-resources, secrets, and Modal sandbox options before deploying it.
+`init` writes an editable `pools/gpu-training.py` configuration. Customize its
+worker image, resources, secrets, and Modal sandbox options before deploying
+the all-pools control plane.
 
 For a repository-scoped pool:
 
@@ -33,9 +34,9 @@ Add `--private-repo` to configure a worker-side Modal secret containing
 unsupported repository hosts fail during configuration instead of during a
 worker launch.
 
-Destroying a pool stops its Modal application and uses the live Cursor registry
-record—including `repo_owner` and `repo_name` for repository-scoped pools—to
-deregister it:
+Destroying a pool stops the shared Modal control plane and uses the live Cursor
+registry record—including `repo_owner` and `repo_name` for repository-scoped
+pools—to deregister it:
 
 ```bash
 uv run modal-cursor destroy pools/payments.py --yes
@@ -46,20 +47,19 @@ uv run modal-cursor destroy pools/payments.py --yes
 The runtime has four small boundaries:
 
 - `Pool` owns the canonical pool name, repository scope, Cursor registration,
-  and the pinned controller and worker images.
+  and the pinned worker/control-plane images.
 - `Machine` is an immutable worker specification. It rejects environment names
-  and Modal options that would override values needed by the bridge.
-- `Claim` is a Pydantic Settings model. The local executable bridge validates
-  Cursor's claim environment and sends only claim identity and repository data
-  to the Modal spawner.
+  and Modal options that would override values needed by the worker.
+- `Claim` is a Pydantic Settings model for the non-secret values passed from
+  the controller to sandbox provisioning.
 - `registry.py` owns typed request and response models for the Cursor pool and
   claim APIs. Unexpected success payloads fail loudly.
 
-Cursor invokes `/usr/local/bin/modal-cursor-spawn` as an actual executable. The
-Modal spawner monitors the sandbox until Cursor exposes the claimed worker ID,
-failing on an early process exit or a readiness timeout. The bridge reports
-success only after that check; otherwise it releases the Cursor claim and exits
-nonzero.
+The control plane uses Cursor's unfiltered pending-request stream, routes each
+request by its pool label, atomically claims it, and provisions the matching
+Modal sandbox. The provisioner monitors the sandbox until Cursor exposes the
+claimed worker ID, failing on an early sandbox exit or readiness timeout; a
+failed claim is released for retry.
 
 The generated controller registers `workerReadyTimeoutSeconds`, the current
 Cursor reconnect-window field. The controller image installs a versioned,
@@ -73,10 +73,9 @@ credential. Store it in a Modal Secret (the generated default is
 `cursor-service-account`) and treat every controller and worker sandbox as part
 of that credential's trust boundary.
 
-The bridge deliberately excludes this key from the Modal function-call payload.
-The controller and spawner receive it from their Modal Secret, and the spawner
-injects it directly into the worker environment because the Cursor worker CLI
-requires it. Private repository credentials are separate: workers receive
+The controller receives this key from its Modal Secret and injects it directly
+into the worker environment because the Cursor worker CLI requires it. Private repository
+credentials are separate: workers receive
 `GITHUB_TOKEN` only when their generated configuration includes the requested
 GitHub Modal Secret.
 
@@ -97,59 +96,70 @@ default service name is `modal-cursor` and can be changed with
 Spans include pool, request, worker, sandbox, and outcome metadata, but never
 Cursor API keys, Modal Secrets, or complete claim/machine payloads.
 
-The controller startup trace is intentionally separate from each request
-trace. The startup context is linked from the request trace, but it is not a
-parent because one long-lived controller handles many requests:
+Cursor's Enterprise OpenTelemetry Export can be routed through the optional
+authenticated Modal bridge when a backend's OTLP acknowledgement is too strict
+for Cursor's connection test. Deploy it with:
 
-```text
-Controller startup trace:
-modal_cursor.controller.invocation
-├─ modal_cursor.pool.register
-└─ modal_cursor.controller.run
-
-Per-request trace:
-modal_cursor.controller.dispatch       # Cursor claimed request → bridge
-└─ modal_cursor.modal.spawner.invoke   # bridge → Modal Function
-   └─ modal_cursor.worker.provision
-      ├─ modal_cursor.worker.create_sandbox
-      └─ modal_cursor.worker.wait_for_cursor_registration
-         ├─ modal_cursor.worker.readiness.poll # attempt=1, not_ready
-         │  └─ GET 404                       # not visible to Cursor yet
-         └─ modal_cursor.worker.readiness.poll # attempt=2, ready
-            └─ GET 200                     # worker connected
+```console
+uv run modal deploy modal_cursor/otel_proxy.py
 ```
 
-Cursor's controller is a closed-source subprocess, so queue discovery and the
-exact claim-selection decision cannot be instrumented from this package. The
-`controller.dispatch` span is the reliable boundary: its presence means
-Cursor has already claimed a concrete request and invoked the bridge. Each
-bridge invocation starts a fresh trace; its downstream Modal spans remain in
-that trace via W3C propagation. The controller-startup context is retained as
-a span link, never reused as a parent, because the same long-lived controller
-process invokes the bridge for many independent requests. The controller is
-intentionally started outside the long-lived `process.wait()` call:
-OpenTelemetry exports spans when they end, so keeping `controller.invocation`
-or `controller.run` open for the controller's entire lifetime would hide the
-parent spans and make the trace appear unstructured until shutdown.
-Readiness spans record whether the sandbox process remained alive, whether
-registration was pending, the poll count, the registration outcome, and the
-registration elapsed time. Each readiness poll remains a child span, making
-the interval before the spawner function begins visible as remote invocation
-startup/scheduling time without turning routine state transitions into extra
-records.
+Use the printed `modal.run` URL as Cursor's collector base URL, without `/v1`.
+Add an `X-Logfire-Token` header whose value is the Logfire write token stored in
+the `logfire-token` Modal Secret, then enable logs and metrics. The bridge
+forwards `/v1/logs` and `/v1/metrics` to Logfire and returns a protobuf
+acknowledgement. It uses the existing Logfire token for inbound authentication;
+deploy behind a separate ingress credential if the endpoint will be shared
+beyond this team. `Authorization` is also accepted, but the dedicated header
+avoids client-specific authorization-header handling.
+
+The controller's long-lived run span is a parent for registration, stream, and
+dispatch work. Each request has a normal child trace, so concurrent requests do
+not merge into one waterfall:
+
+```text
+Control-plane trace:
+modal_cursor.controller.run
+├─ modal_cursor.controller.startup
+│  ├─ modal_cursor.pool.register
+│  └─ modal_cursor.pool.register
+└─ modal_cursor.registry.watch_pending_requests
+
+Per-request trace:
+modal_cursor.controller.dispatch
+├─ modal_cursor.registry.claim_pending_request
+└─ modal_cursor.worker.provision
+   ├─ modal_cursor.worker.create_sandbox
+   └─ modal_cursor.worker.wait_for_cursor_registration
+      ├─ modal_cursor.worker.registration.poll # attempt=1, not_ready
+      │  └─ GET 404                       # not visible to Cursor yet
+      └─ modal_cursor.worker.registration.poll # attempt=2, ready
+         └─ GET 200                     # worker connected
+```
+
+Cursor's Enterprise OpenTelemetry export is logs and metrics, not a parent
+trace emitted by the Cursor worker controller. The controller therefore owns
+the request lifecycle and uses the Cursor request/conversation ID as a
+low-cardinality correlation attribute. Cursor's records can be joined in
+Logfire by `cursor.conversation.id`, but they cannot be made children of our
+Modal spans without a W3C trace context from Cursor.
+Registration-wait spans record whether the sandbox process remained alive,
+whether registration was pending, the poll count, the registration outcome,
+and the registration elapsed time. Each registration poll remains a child
+span, making the interval before the worker becomes visible to Cursor explicit
+without turning routine state transitions into extra records.
 
 ## Operations
 
 `modal-cursor doctor` checks more than object existence. It verifies Modal
-credentials, declared secrets, a running controller container, the Cursor
+credentials, declared secrets, the shared control-plane container, the Cursor
 registry response schema, registration drift, and connected/in-use worker
 counts. Zero connected workers is valid for a scale-to-zero pool; zero running
-controller containers is not.
+control-plane containers is not.
 
-Pool files remain ordinary Python applications. The CLI reads only their
-literal secret declarations for diagnostics and derives application identity
-from the filename. It does not execute local pool files during lifecycle
-commands.
+Pool files remain ordinary Python configuration modules. The CLI reads only
+their literal secret declarations for diagnostics; the deployment module loads
+the selected pool files to construct one shared Modal application.
 
 ## Development
 

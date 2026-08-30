@@ -1,25 +1,14 @@
-"""Generated Modal application for one editable Cursor worker pool."""
+"""Generated configuration for one editable Cursor worker pool."""
 
 import modal
-import subprocess
 
 from modal_cursor import Pool
-from modal_cursor.pools import RuntimeSettings
-from modal_cursor.spawn import spawn_worker
-from modal_cursor.telemetry import span
 
 CURSOR_SECRET_NAME = $secret_name
 LOGFIRE_SECRET_NAME = $logfire_secret_name
 WORKER_SECRET_NAMES = $worker_secret_names
 
 pool = Pool(name=$pool_name$pool_options)
-settings = RuntimeSettings()
-app = modal.App($app_name, tags={"service": "modal-cursor"})
-
-cursor_secret = modal.Secret.from_name(CURSOR_SECRET_NAME, required_keys=["CURSOR_API_KEY"])
-logfire_secret = modal.Secret.from_name(LOGFIRE_SECRET_NAME, required_keys=["LOGFIRE_TOKEN"])
-controller_secrets = [cursor_secret, logfire_secret]
-controller_image = pool.controller_image()
 worker = pool.machine(
     image=pool.worker_image(),  # Add application-specific image layers here.
     secrets=[modal.Secret.from_name(name) for name in WORKER_SECRET_NAMES],
@@ -27,29 +16,3 @@ worker = pool.machine(
     # cpu=4,
     # memory=16384,
 )
-
-
-@app.function(
-    image=controller_image,
-    secrets=controller_secrets,
-    max_containers=1,
-    retries=modal.Retries(max_retries=settings.controller_max_retries),
-    timeout=settings.controller_timeout_s,
-)
-def controller() -> None:
-    with span(
-        "modal_cursor.controller.invocation",
-        **{"modal_cursor.pool.name": pool.name, "modal_cursor.app.name": pool.app_name},
-    ):
-        pool.register()
-        process = pool.start_controller()
-    returncode = process.wait()
-    if returncode:
-        raise subprocess.CalledProcessError(returncode, process.args)
-
-
-@app.function(image=controller_image, secrets=controller_secrets)
-def spawner(
-    claim_env: dict[str, object], trace_carrier: dict[str, str] | None = None
-) -> str:
-    return spawn_worker(pool, worker, app, claim_env, trace_carrier)

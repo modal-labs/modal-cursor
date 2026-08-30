@@ -6,7 +6,7 @@ import ast
 import os
 import subprocess
 import sys
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from importlib.resources import files
 from pathlib import Path
 from string import Template
@@ -35,6 +35,9 @@ from modal_cursor.telemetry import instrument, record_exception, set_attribute, 
 app = cyclopts.App(name="modal-cursor")
 TEMPLATE = files("modal_cursor").joinpath("templates", "pool.py.tmpl")
 CURSOR_DOCS_URL = "https://cursor.com/docs/account/enterprise/service-accounts"
+CONTROL_PLANE_APP_NAME = "modal-cursor-control-plane"
+CONTROL_PLANE_FILE = Path(__file__).with_name("control_plane.py")
+POOL_FILES_ENV = "MODAL_CURSOR_POOL_FILES"
 
 PoolNameArg = Annotated[
     str, cyclopts.Parameter(help="Lowercase pool slug, for example gpu-training.")
@@ -101,13 +104,23 @@ def _confirm(question: str, *, default: bool = False) -> bool:
     return bool(Confirm.ask(question, console=_console, default=default))
 
 
-def _modal(*args: str, capture_output: bool = True) -> subprocess.CompletedProcess[str]:
+def _modal(
+    *args: str,
+    capture_output: bool = True,
+    env: Mapping[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    command = [sys.executable, "-m", "modal", *args]
+    if env is None:
+        return subprocess.run(
+            command, capture_output=capture_output, text=True, timeout=30, check=False
+        )
     return subprocess.run(
-        [sys.executable, "-m", "modal", *args],
+        command,
         capture_output=capture_output,
         text=True,
         timeout=30,
         check=False,
+        env=env,
     )
 
 
@@ -124,9 +137,12 @@ def _secret_names() -> set[str]:
     return {secret.name for secret in secrets if secret.name}
 
 
-def _modal_deploy(pool_file: Path) -> int:
+def _modal_deploy(pool_files: Path | Iterable[Path]) -> int:
+    files = (pool_files,) if isinstance(pool_files, Path) else tuple(pool_files)
+    env = os.environ.copy()
+    env[POOL_FILES_ENV] = os.pathsep.join(str(file.resolve()) for file in files)
     return _modal(
-        "deploy", "--strategy", "rolling", str(pool_file), capture_output=False
+        "deploy", "--strategy", "rolling", str(CONTROL_PLANE_FILE), capture_output=False, env=env
     ).returncode
 
 
@@ -186,66 +202,61 @@ def _required_secrets(pool_file: Path) -> set[str]:
     return required
 
 
-def _deploy_and_start(file: Path, pool: Pool) -> bool:
+def _deploy_and_start(files: list[Path]) -> bool:
+    pools = [_pool_from_file(file) for file in files]
     with span(
-        "modal_cursor.cli.deploy_pool",
+        "modal_cursor.cli.deploy_control_plane",
         **{
-            "modal_cursor.pool.name": pool.name,
-            "modal_cursor.pool.file": str(file),
+            "modal_cursor.pool.count": len(pools),
+            "modal_cursor.pool.names": ",".join(pool.name for pool in pools),
         },
     ) as current:
-        _console.print(f"Running modal deploy {file}...")
-        if _modal_deploy(file) != 0:
+        _console.print("Running modal deploy for " + ", ".join(str(file) for file in files) + "...")
+        if _modal_deploy(files) != 0:
             set_attribute(current, "modal_cursor.outcome", "failure")
-            _error(f"{file} failed to deploy")
+            _error("Control-plane deployment failed")
             return False
         try:
             from_name = cast(Callable[[str, str], _ModalFunction], modal.Function.from_name)
-            from_name(pool.app_name, "controller").spawn()
+            from_name(CONTROL_PLANE_APP_NAME, "controller").spawn()
         except modal.exception.Error as error:
             record_exception(current, error)
             set_attribute(current, "modal_cursor.outcome", "failure")
-            _error(f"Deployed {file}, but the controller failed to start: {error}")
+            _error(f"Deployed control plane, but the controller failed to start: {error}")
             return False
-        _ok(f"Deployed {file}; controller starting for pool {pool.name}")
+        _ok(
+            "Deployed the all-pools control plane; controller starting for "
+            + ", ".join(pool.name for pool in pools)
+        )
         set_attribute(current, "modal_cursor.outcome", "success")
         return True
 
 
-def _stop_modal_app(pool: Pool) -> bool:
-    """Stop one app, treating an already-absent app as success."""
+def _stop_control_plane_app() -> bool:
+    """Stop the one app that owns registration and dispatch for every pool."""
     with span(
-        "modal_cursor.cli.stop_app",
-        **{
-            "modal_cursor.pool.name": pool.name,
-            "modal_cursor.app.name": pool.app_name,
-        },
+        "modal_cursor.cli.stop_control_plane",
+        **{"modal_cursor.app.name": CONTROL_PLANE_APP_NAME},
     ) as current:
         try:
-            modal.App.lookup(pool.app_name, create_if_missing=False)
+            modal.App.lookup(CONTROL_PLANE_APP_NAME, create_if_missing=False)
         except modal.exception.NotFoundError:
             set_attribute(current, "modal_cursor.outcome", "already_absent")
-            _ok(f"Modal app {pool.app_name} is not deployed")
+            _ok(f"Modal app {CONTROL_PLANE_APP_NAME} is not deployed")
             return True
         except modal.exception.Error as error:
             record_exception(current, error)
             set_attribute(current, "modal_cursor.outcome", "failure")
-            _error(f"Could not inspect Modal app {pool.app_name}: {error}")
+            _error(f"Could not inspect Modal app {CONTROL_PLANE_APP_NAME}: {error}")
             return False
-        try:
-            result = _modal("app", "stop", "--yes", pool.app_name)
-        except (OSError, subprocess.TimeoutExpired) as error:
-            record_exception(current, error)
-            set_attribute(current, "modal_cursor.outcome", "failure")
-            _error(f"Modal app {pool.app_name} stop failed: {error}")
-            return False
+        result = _modal("app", "stop", "--yes", CONTROL_PLANE_APP_NAME)
         if result.returncode != 0:
             set_attribute(current, "modal_cursor.outcome", "failure")
             detail = (result.stderr or result.stdout).strip()
-            _error(f"Modal app {pool.app_name} stop failed: {detail or result.returncode}")
+            _error(f"Modal app {CONTROL_PLANE_APP_NAME} stop failed: {detail or result.returncode}")
             return False
-        _ok(f"Stopped Modal app {pool.app_name}")
         set_attribute(current, "modal_cursor.outcome", "success")
+        _ok(f"Stopped Modal app {CONTROL_PLANE_APP_NAME}")
         return True
 
 
@@ -312,21 +323,25 @@ def _check_local_pool(pool_file: Path, pool: Pool, secret_names: set[str]) -> in
         failures += 1
     else:
         _ok(f"{pool_file} has all required Modal secrets")
-    try:
-        modal.App.lookup(pool.app_name, create_if_missing=False)
-        from_name = cast(Callable[[str, str], _ModalFunction], modal.Function.from_name)
-        stats = from_name(pool.app_name, "controller").get_current_stats()
-    except modal.exception.NotFoundError:
-        _error(f"{pool_file} has no deployed controller")
-        return failures + 1
-    except modal.exception.Error as error:
-        _error(f"Could not inspect controller for {pool_file}: {error}")
-        return failures + 1
-    if stats.num_total_runners < 1:
-        _error(f"{pool_file} is deployed, but its controller has no running container")
-        return failures + 1
-    _ok(f"{pool_file} controller is running")
     return failures
+
+
+def _check_control_plane() -> int:
+    try:
+        modal.App.lookup(CONTROL_PLANE_APP_NAME, create_if_missing=False)
+        from_name = cast(Callable[[str, str], _ModalFunction], modal.Function.from_name)
+        stats = from_name(CONTROL_PLANE_APP_NAME, "controller").get_current_stats()
+    except modal.exception.NotFoundError:
+        _error(f"No deployed {CONTROL_PLANE_APP_NAME} controller")
+        return 1
+    except modal.exception.Error as error:
+        _error(f"Could not inspect {CONTROL_PLANE_APP_NAME}: {error}")
+        return 1
+    if stats.num_total_runners < 1:
+        _error(f"{CONTROL_PLANE_APP_NAME} is deployed, but its controller has no running container")
+        return 1
+    _ok(f"{CONTROL_PLANE_APP_NAME} controller is running")
+    return 0
 
 
 def _check_registry(
@@ -362,23 +377,15 @@ def deploy(
     *,
     pools_dir: PoolsDirOption = Path("pools"),
 ) -> None:
-    """Deploy pool applications and start their singleton controllers."""
+    """Deploy one all-pools control plane and start its singleton controller."""
     pool_files = _pool_files(pool_file, pools_dir)
-    failures: list[Path] = []
-    for file in pool_files:
-        try:
-            pool = _pool_from_file(file)
-        except SystemExit as error:
-            _error(str(error))
-            failures.append(file)
-            continue
-        if not _deploy_and_start(file, pool):
-            failures.append(file)
-    if failures:
-        raise SystemExit(
-            f"{len(failures)} of {len(pool_files)} pool(s) failed to deploy: "
-            + ", ".join(map(str, failures))
-        )
+    try:
+        for file in pool_files:
+            _pool_from_file(file)
+    except SystemExit as error:
+        raise SystemExit(str(error)) from error
+    if not _deploy_and_start(pool_files):
+        raise SystemExit("Control-plane deployment failed")
 
 
 @app.command
@@ -391,7 +398,7 @@ def destroy(
     api_endpoint: ApiEndpointOption = DEFAULT_API_ENDPOINT,
     yes: YesOption = False,
 ) -> None:
-    """Stop Modal applications and deregister all matching Cursor pool records."""
+    """Stop the control plane and deregister all matching Cursor pool records."""
     targets = [
         (file, _pool_from_file(file, scope=scope)) for file in _pool_files(pool_file, pools_dir)
     ]
@@ -414,11 +421,10 @@ def destroy(
     try:
         with cursor_client(endpoint, token) as client:
             registry = list_pools(client)
+            if not _stop_control_plane_app():
+                raise SystemExit("Destroy incomplete; control-plane stop failed")
             failures: list[str] = []
             for file, pool in targets:
-                if not _stop_modal_app(pool):
-                    failures.append(f"{file} (Modal stop)")
-                    continue
                 if not _deregister_matches(client, pool, scope, registry):
                     failures.append(f"{file} (Cursor deregistration)")
     except (httpx.HTTPError, RegistrySchemaError, ValueError) as error:
@@ -547,7 +553,7 @@ def init_pool(  # noqa: PLR0912 - one linear CLI workflow with explicit user dec
         else interactive and _confirm(f"Deploy {pool.name} now?", default=True)
     )
     if should_deploy:
-        if not _deploy_and_start(out_path, pool):
+        if not _deploy_and_start([out_path]):
             raise SystemExit(1)
     else:
         _console.print(f"Deploy with: modal-cursor deploy {out_path}")
@@ -561,7 +567,7 @@ def doctor(
     scope: ScopeOption = "team",
     api_endpoint: ApiEndpointOption = DEFAULT_API_ENDPOINT,
 ) -> None:
-    """Verify credentials, secrets, controller runners, registration, and workers."""
+    """Verify credentials, secrets, the control-plane runner, and registrations."""
     failures = 0
     if _modal_is_configured():
         _ok("Modal credentials are valid")
@@ -591,6 +597,9 @@ def doctor(
         except ConfigError as error:
             _error(str(error))
             failures += 1
+
+    if local_pools:
+        failures += _check_control_plane()
 
     token = os.environ.get("CURSOR_API_KEY")
     registry: list[RegisteredPool] | None = None

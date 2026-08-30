@@ -12,7 +12,7 @@ addopts = "--strict-config --strict-markers"
 [tool.coverage.run]
 branch = true
 source = ["modal_cursor"]
-omit = ["modal_cursor/__main__.py", "modal_cursor/_spawn_bridge.py"]
+omit = ["modal_cursor/__main__.py"]
 
 [tool.coverage.report]
 fail_under = 80
@@ -45,6 +45,7 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "cyclopts>=4.20,<5",
+    "fastapi>=0.115,<1",
     "httpx>=0.28.1,<1",
     "logfire[httpx]>=4.41,<5",
     "modal>=1.5.4,<2",

@@ -2,14 +2,15 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+import json
+from collections.abc import Iterator, Mapping
 from typing import Literal, TypeAlias, cast
 from urllib.parse import quote, urlsplit
 
 import httpx
 from pydantic import BaseModel, ConfigDict, ValidationError, model_validator
 
-from modal_cursor.telemetry import current_span, instrument, instrument_httpx, set_attribute
+from modal_cursor.telemetry import current_span, instrument, instrument_httpx, set_attribute, span
 
 DEFAULT_API_ENDPOINT = "https://api.cursor.com"
 HTTP_NOT_FOUND = 404
@@ -20,6 +21,90 @@ PoolScope: TypeAlias = Literal["team", "user"]
 
 class RegistrySchemaError(ValueError):
     """Cursor returned a successful response with an invalid pool schema."""
+
+
+class PendingRequest(BaseModel):
+    """A request waiting for a worker from one of the registered pools."""
+
+    model_config = ConfigDict(extra="ignore", strict=True)
+
+    request_id: str
+    pool: str
+    repo_url: str | None = None
+    claimed_worker_id: str | None = None
+
+    @classmethod
+    def from_payload(cls, value: object) -> PendingRequest:
+        if not isinstance(value, Mapping):
+            raise RegistrySchemaError("Cursor pending request is not an object")
+        raw = cast(Mapping[str, object], value)
+        labels = raw.get("labels")
+        pool: str | None = None
+        if isinstance(labels, list):
+            for label in cast(list[object], labels):
+                if not isinstance(label, Mapping):
+                    continue
+                label_mapping = cast(Mapping[str, object], label)
+                if label_mapping.get("key") == "pool" and isinstance(
+                    label_mapping.get("value"), str
+                ):
+                    pool = cast(str, label_mapping["value"])
+                    break
+        request_id = raw.get("id")
+        if not isinstance(request_id, str) or not request_id:
+            raise RegistrySchemaError("Cursor pending request is missing an id")
+        if not pool:
+            raise RegistrySchemaError(f"Cursor pending request {request_id!r} is missing a pool")
+        repo_url = raw.get("repoUrl")
+        if repo_url is not None and not isinstance(repo_url, str):
+            raise RegistrySchemaError(
+                f"Cursor pending request {request_id!r} has an invalid repoUrl"
+            )
+        claimed_worker_id = raw.get("claimedWorkerId")
+        if claimed_worker_id is not None and not isinstance(claimed_worker_id, str):
+            raise RegistrySchemaError(
+                f"Cursor pending request {request_id!r} has an invalid claimedWorkerId"
+            )
+        return cls(
+            request_id=request_id,
+            pool=pool,
+            repo_url=repo_url,
+            claimed_worker_id=claimed_worker_id,
+        )
+
+    def claim_payload(self, worker_id: str) -> dict[str, object]:
+        """Build the non-secret claim payload consumed by worker provisioning."""
+        return {
+            "agent_worker_id": worker_id,
+            "pool": self.pool,
+            "request_id": self.request_id,
+            "worker_name": None,
+            "repo_url": self.repo_url,
+            "repo_urls": (),
+        }
+
+
+class PendingRequestEvent(BaseModel):
+    """One event from Cursor's all-pools pending-request stream."""
+
+    model_config = ConfigDict(frozen=True, strict=True)
+
+    event: str
+    cursor: str | None = None
+    request: PendingRequest | None = None
+
+
+def _pending_requests_payload(value: object) -> tuple[list[PendingRequest], str]:
+    if not isinstance(value, Mapping):
+        raise RegistrySchemaError("Cursor pending-request response is not an object")
+    raw = cast(Mapping[str, object], value)
+    requests = raw.get("requests")
+    cursor = raw.get("streamCursor")
+    if not isinstance(requests, list) or not isinstance(cursor, str) or not cursor:
+        raise RegistrySchemaError(
+            "Cursor pending-request response is missing requests or streamCursor"
+        )
+    return [PendingRequest.from_payload(item) for item in cast(list[object], requests)], cursor
 
 
 class Repository(BaseModel):
@@ -205,6 +290,80 @@ def list_pools(client: httpx.Client) -> list[RegisteredPool]:
     result = [RegisteredPool.from_payload(item) for item in cast(list[object], pools)]
     set_attribute(current, "modal_cursor.pool.count", len(result))
     return result
+
+
+@instrument("modal_cursor.registry.list_pending_requests")
+def list_pending_requests(client: httpx.Client) -> tuple[list[PendingRequest], str]:
+    """List pending requests across every pool visible to this service account."""
+    response = client.get("/v0/private-workers/pending-requests")
+    set_attribute(current_span(), "http.response.status_code", response.status_code)
+    response.raise_for_status()
+    requests, cursor = _pending_requests_payload(response.json())
+    set_attribute(current_span(), "modal_cursor.pending_request.count", len(requests))
+    return requests, cursor
+
+
+def watch_pending_requests(client: httpx.Client, cursor: str) -> Iterator[PendingRequestEvent]:
+    """Yield all-pools pending-request events from Cursor's SSE stream."""
+    with (
+        span(
+            "modal_cursor.registry.watch_pending_requests", **{"modal_cursor.stream.cursor": cursor}
+        ),
+        client.stream(
+            "GET",
+            "/v0/private-workers/pending-requests/stream",
+            params={"cursor": cursor},
+            headers={"Accept": "text/event-stream"},
+            timeout=None,
+        ) as response,
+    ):
+        response.raise_for_status()
+        set_attribute(current_span(), "http.response.status_code", response.status_code)
+        event_name = "message"
+        event_cursor: str | None = None
+        data_lines: list[str] = []
+        for line in response.iter_lines():
+            if line == "":
+                if data_lines:
+                    data = json.loads("\n".join(data_lines))
+                    request = (
+                        PendingRequest.from_payload(data)
+                        if event_name in {"created", "claimed_offline"}
+                        else None
+                    )
+                    yield PendingRequestEvent(
+                        event=event_name,
+                        cursor=event_cursor,
+                        request=request,
+                    )
+                event_name = "message"
+                event_cursor = None
+                data_lines = []
+                continue
+            if line.startswith(":"):
+                continue
+            field, _, value = line.partition(":")
+            value = value[1:] if value.startswith(" ") else value
+            if field == "event":
+                event_name = value
+            elif field == "id":
+                event_cursor = value
+            elif field == "data":
+                data_lines.append(value)
+
+
+@instrument("modal_cursor.registry.claim_pending_request")
+def claim_pending_request(client: httpx.Client, request_id: str, worker_id: str) -> None:
+    """Atomically reserve one pending request for a worker identity."""
+    current = current_span()
+    set_attribute(current, "modal_cursor.request.id", request_id)
+    set_attribute(current, "modal_cursor.worker.id", worker_id)
+    response = client.post(
+        "/v0/private-workers/claim",
+        json={"id": request_id, "workerId": worker_id},
+    )
+    set_attribute(current, "http.response.status_code", response.status_code)
+    response.raise_for_status()
 
 
 @instrument("modal_cursor.registry.deregister_pool")
