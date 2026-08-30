@@ -10,7 +10,7 @@ from urllib.parse import quote, urlsplit
 import httpx
 from pydantic import BaseModel, ConfigDict, ValidationError, model_validator
 
-from modal_cursor.telemetry import current_span, instrument, instrument_httpx, set_attribute, span
+from modal_cursor.telemetry import current_span, instrument, instrument_httpx, set_attribute
 
 DEFAULT_API_ENDPOINT = "https://api.cursor.com"
 HTTP_NOT_FOUND = 404
@@ -305,18 +305,17 @@ def list_pending_requests(client: httpx.Client) -> tuple[list[PendingRequest], s
 
 def watch_pending_requests(client: httpx.Client, cursor: str) -> Iterator[PendingRequestEvent]:
     """Yield all-pools pending-request events from Cursor's SSE stream."""
-    with (
-        span(
-            "modal_cursor.registry.watch_pending_requests", **{"modal_cursor.stream.cursor": cursor}
-        ),
-        client.stream(
-            "GET",
-            "/v0/private-workers/pending-requests/stream",
-            params={"cursor": cursor},
-            headers={"Accept": "text/event-stream"},
-            timeout=None,
-        ) as response,
-    ):
+    # The HTTPX instrumentation owns the actual stream span. Do not wrap the
+    # generator in another process-lifetime span: the response stays open while
+    # the controller waits for events, which delays export and obscures the
+    # per-request traces created by the dispatcher.
+    with client.stream(
+        "GET",
+        "/v0/private-workers/pending-requests/stream",
+        params={"cursor": cursor},
+        headers={"Accept": "text/event-stream"},
+        timeout=None,
+    ) as response:
         response.raise_for_status()
         set_attribute(current_span(), "http.response.status_code", response.status_code)
         event_name = "message"

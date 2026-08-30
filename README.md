@@ -113,19 +113,21 @@ deploy behind a separate ingress credential if the endpoint will be shared
 beyond this team. `Authorization` is also accepted, but the dedicated header
 avoids client-specific authorization-header handling.
 
-The controller's long-lived run span is a parent for registration, stream, and
-dispatch work. Each request has a normal child trace, so concurrent requests do
-not merge into one waterfall:
+The controller does not keep one process-lifetime span open: exporters only
+make completed spans queryable, and a durable controller would otherwise hide
+its root indefinitely. Registration and pending-request polling are bounded
+operational spans. Each asynchronous request dispatch is its own visible root
+trace, with a span link back to the controller context at discovery time, so
+concurrent requests do not merge into one waterfall:
 
 ```text
-Control-plane trace:
-modal_cursor.controller.run
+Control-plane operational spans:
 ├─ modal_cursor.controller.startup
 │  ├─ modal_cursor.pool.register
 │  └─ modal_cursor.pool.register
-└─ modal_cursor.registry.watch_pending_requests
+└─ modal_cursor.registry.list_pending_requests
 
-Per-request trace:
+Per-request trace (linked to controller discovery context):
 modal_cursor.controller.dispatch
 ├─ modal_cursor.registry.claim_pending_request
 └─ modal_cursor.worker.provision
@@ -140,9 +142,11 @@ modal_cursor.controller.dispatch
 Cursor's Enterprise OpenTelemetry export is logs and metrics, not a parent
 trace emitted by the Cursor worker controller. The controller therefore owns
 the request lifecycle and uses the Cursor request/conversation ID as a
-low-cardinality correlation attribute. Cursor's records can be joined in
-Logfire by `cursor.conversation.id`, but they cannot be made children of our
-Modal spans without a W3C trace context from Cursor.
+correlation attribute. Cursor's records can be joined in Logfire by
+`cursor.conversation.id`, but they cannot be made children of our Modal spans
+without a W3C trace context from Cursor. Because discovery and dispatch cross
+an asynchronous queue/thread boundary, the controller uses a span link rather
+than pretending the dispatch is a synchronous child of the polling loop.
 Registration-wait spans record whether the sandbox process remained alive,
 whether registration was pending, the poll count, the registration outcome,
 and the registration elapsed time. Each registration poll remains a child

@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import time
 import uuid
+from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from threading import Lock
@@ -26,7 +27,7 @@ from modal_cursor.spawn import spawn_worker
 from modal_cursor.telemetry import (
     flush_at_exit,
     inject_trace_context,
-    instrument,
+    new_root_span,
     record_exception,
     set_attribute,
     span,
@@ -63,17 +64,28 @@ class _Dispatcher:
             if request.request_id in self._inflight:
                 return
             self._inflight.add(request.request_id)
-        self._executor.submit(self._dispatch, request, claim_exists)
+        # Dispatch runs asynchronously from the Cursor polling/SSE loop. Carry
+        # the discovery context as a link rather than a parent so the job trace
+        # remains visible and self-contained after the loop continues.
+        carrier: dict[str, str] = {}
+        inject_trace_context(carrier)
+        self._executor.submit(self._dispatch, request, claim_exists, carrier)
 
     def close(self) -> None:
         self._executor.shutdown(wait=True)
 
-    def _dispatch(self, request: PendingRequest, claim_exists: bool) -> None:
+    def _dispatch(
+        self,
+        request: PendingRequest,
+        claim_exists: bool,
+        discovery_carrier: Mapping[str, str] | None = None,
+    ) -> None:
         claim_acquired = claim_exists
         try:
             spec = self._specs.get(request.pool)
             if spec is None:
-                with span(
+                with new_root_span(
+                    discovery_carrier or {},
                     "modal_cursor.controller.dispatch",
                     **{
                         "modal_cursor.pool.name": request.pool,
@@ -86,7 +98,8 @@ class _Dispatcher:
                 return
             worker_id = request.claimed_worker_id or f"ctrl-{uuid.uuid4()}"
             claim_payload = request.claim_payload(worker_id)
-            with span(
+            with new_root_span(
+                discovery_carrier or {},
                 "modal_cursor.controller.dispatch",
                 **{
                     "modal_cursor.pool.name": request.pool,
@@ -141,9 +154,13 @@ def _register_pools(client: httpx.Client, specs: tuple[PoolSpec, ...]) -> None:
                 register_pool(client, spec.pool.registration)
 
 
-@instrument("modal_cursor.controller.run")
 def run_control_plane(app: modal.App, specs: tuple[PoolSpec, ...]) -> None:
-    """Register all pools and dispatch requests from one unfiltered Cursor stream."""
+    """Register all pools and dispatch requests from one unfiltered Cursor stream.
+
+    This loop is intentionally not represented by one process-lifetime span.
+    Individual dispatches are asynchronous job traces, linked back to the
+    controller context at discovery time.
+    """
     if not specs:
         raise ValueError("at least one pool is required")
     endpoint = specs[0].pool.api_endpoint

@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import warnings
 from unittest.mock import ANY, Mock
+
+from logfire.testing import CaptureLogfire
 
 from modal_cursor import Pool
 from modal_cursor import controller as controller_module
 from modal_cursor.controller import PoolSpec, _Dispatcher
 from modal_cursor.registry import PendingRequest
+from modal_cursor.telemetry import inject_trace_context, span
 
 
 def _request(pool: str = "gpu") -> PendingRequest:
@@ -41,3 +45,30 @@ def test_dispatch_releases_claim_when_provisioning_fails(monkeypatch) -> None:
     dispatcher.close()
 
     controller_module.release_claim.assert_called_once_with(client, "bc-1")
+
+
+def test_async_dispatch_is_visible_root_with_discovery_link(
+    monkeypatch, capfire: CaptureLogfire
+) -> None:
+    worker = Pool(name="gpu").machine(image="image")
+    client = Mock()
+    monkeypatch.setattr(controller_module, "claim_pending_request", Mock())
+    monkeypatch.setattr(controller_module, "spawn_worker", Mock(return_value="sb-1"))
+    carrier: dict[str, str] = {}
+    with span("modal_cursor.test.discovery"):
+        inject_trace_context(carrier)
+
+    dispatcher = _Dispatcher(Mock(), (PoolSpec(Pool(name="gpu"), worker),), client)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        dispatcher._dispatch(_request(), claim_exists=False, discovery_carrier=carrier)
+    dispatcher.close()
+
+    spans = [
+        item
+        for item in capfire.exporter.exported_spans
+        if item.attributes.get("logfire.span_type") == "span"
+    ]
+    dispatch = next(item for item in spans if item.name == "modal_cursor.controller.dispatch")
+    assert dispatch.parent is None
+    assert len(dispatch.links) == 1
