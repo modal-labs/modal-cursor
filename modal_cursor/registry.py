@@ -9,6 +9,8 @@ from urllib.parse import quote, urlsplit
 import httpx
 from pydantic import BaseModel, ConfigDict, ValidationError, model_validator
 
+from modal_cursor.telemetry import current_span, instrument, instrument_httpx, set_attribute
+
 DEFAULT_API_ENDPOINT = "https://api.cursor.com"
 HTTP_NOT_FOUND = 404
 REPOSITORY_PATH_PARTS = 2
@@ -170,16 +172,29 @@ class RegisteredPool(BaseModel):
 
 def cursor_client(api_endpoint: str, token: str) -> httpx.Client:
     """Create the one authenticated client used for a Cursor operation."""
-    return httpx.Client(base_url=api_endpoint, auth=(token, ""), timeout=30.0)
+    client = httpx.Client(base_url=api_endpoint, auth=(token, ""), timeout=30.0)
+    instrument_httpx(client)
+    return client
 
 
+@instrument("modal_cursor.registry.register_pool")
 def register_pool(client: httpx.Client, registration: PoolRegistration) -> None:
+    current = current_span()
+    set_attribute(current, "modal_cursor.pool.name", registration.name)
+    set_attribute(current, "modal_cursor.pool.scope", registration.scope)
+    set_attribute(
+        current, "modal_cursor.pool.repository_scoped", registration.repository is not None
+    )
     response = client.post("/v0/private-workers/pools", json=registration.request_body())
+    set_attribute(current, "http.response.status_code", response.status_code)
     response.raise_for_status()
 
 
+@instrument("modal_cursor.registry.list_pools")
 def list_pools(client: httpx.Client) -> list[RegisteredPool]:
+    current = current_span()
     response = client.get("/v0/private-workers/pools")
+    set_attribute(current, "http.response.status_code", response.status_code)
     response.raise_for_status()
     payload: object = response.json()
     if not isinstance(payload, Mapping):
@@ -187,20 +202,33 @@ def list_pools(client: httpx.Client) -> list[RegisteredPool]:
     pools = cast(Mapping[str, object], payload).get("pools")
     if not isinstance(pools, list):
         raise RegistrySchemaError("Cursor pool response is missing the 'pools' array")
-    return [RegisteredPool.from_payload(item) for item in cast(list[object], pools)]
+    result = [RegisteredPool.from_payload(item) for item in cast(list[object], pools)]
+    set_attribute(current, "modal_cursor.pool.count", len(result))
+    return result
 
 
+@instrument("modal_cursor.registry.deregister_pool")
 def deregister_pool(client: httpx.Client, pool: RegisteredPool) -> None:
+    current = current_span()
+    set_attribute(current, "modal_cursor.pool.name", pool.name)
+    set_attribute(current, "modal_cursor.pool.scope", pool.scope)
+    set_attribute(current, "modal_cursor.pool.repository_scoped", pool.repository is not None)
     params: dict[str, str] = {"scope": pool.scope, "pool_name": pool.name}
     if pool.repository is not None:
         params.update(repo_owner=pool.repository.owner, repo_name=pool.repository.name)
     response = client.delete("/v0/private-workers/pools", params=params)
+    set_attribute(current, "http.response.status_code", response.status_code)
     response.raise_for_status()
 
 
+@instrument("modal_cursor.registry.release_claim")
 def release_claim(client: httpx.Client, request_id: str) -> None:
+    current = current_span()
+    set_attribute(current, "modal_cursor.request.id", request_id)
     response = client.post(f"/v0/private-workers/claims/{request_id}/release")
+    set_attribute(current, "http.response.status_code", response.status_code)
     if response.status_code == HTTP_NOT_FOUND:
+        set_attribute(current, "modal_cursor.claim.already_released", True)
         return
     response.raise_for_status()
 
@@ -214,7 +242,8 @@ def worker_connected(client: httpx.Client, worker_id: str) -> bool:
     payload: object = response.json()
     if not isinstance(payload, Mapping):
         raise RegistrySchemaError("Cursor worker response has an invalid workerId")
-    worker = cast(Mapping[str, object], payload).get("worker")
+    payload_mapping = cast(Mapping[str, object], payload)
+    worker = payload_mapping.get("worker", payload_mapping)
     if not isinstance(worker, Mapping):
         raise RegistrySchemaError("Cursor worker response has an invalid workerId")
     if cast(Mapping[str, object], worker).get("workerId") != worker_id:

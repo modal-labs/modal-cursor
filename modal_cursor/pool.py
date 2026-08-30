@@ -26,6 +26,7 @@ from modal_cursor.registry import (
     cursor_client,
     register_pool,
 )
+from modal_cursor.telemetry import current_span, inject_trace_context, instrument, set_attribute
 
 MAX_NAME_LENGTH = 50  # "modal-cursor-" + 50 characters fits Modal's 64-char cap.
 SPAWN_BRIDGE_PATH = "/usr/local/bin/modal-cursor-spawn"
@@ -37,6 +38,7 @@ _CURSOR_CLI_URL = (
 _CURSOR_CLI_SHA256 = "76c213c284647a1cf5fb47897e1bb1953e89b345c048ca869135d4b556e0b859"
 _CONTROLLER_DEPENDENCIES = (
     "httpx==0.28.1",
+    "logfire[httpx]==4.41.0",
     "modal==1.5.4",
     "pydantic-settings==2.15.0",
 )
@@ -160,15 +162,26 @@ class Pool(BaseModel):
             sandbox_options=sandbox_options,
         )
 
+    @instrument("modal_cursor.pool.register")
     def register(self) -> None:
         """Register this pool from its own metadata before the controller starts."""
+        current = current_span()
+        set_attribute(current, "modal_cursor.pool.name", self.name)
+        set_attribute(current, "modal_cursor.pool.scope", self.scope)
+        set_attribute(current, "modal_cursor.pool.repository_scoped", self.repo_url is not None)
         endpoint = os.environ.get("CURSOR_API_ENDPOINT", self.api_endpoint)
         with cursor_client(endpoint, os.environ["CURSOR_API_KEY"]) as client:
             register_pool(client, self.registration)
 
-    def run_controller(self) -> None:
-        """Run Cursor's controller with the executable bridge shipped in its image."""
-        subprocess.run(
+    @instrument("modal_cursor.controller.run")
+    def start_controller(self) -> subprocess.Popen[bytes]:
+        """Start Cursor's controller and return before its long-lived process ends."""
+        current = current_span()
+        set_attribute(current, "modal_cursor.pool.name", self.name)
+        set_attribute(current, "modal_cursor.app.name", self.app_name)
+        env = {**os.environ, APP_NAME_ENV: self.app_name}
+        inject_trace_context(env)
+        process = subprocess.Popen(
             [
                 CURSOR_AGENT_PATH,
                 "worker",
@@ -178,6 +191,14 @@ class Pool(BaseModel):
                 "--pool",
                 self.name,
             ],
-            check=True,
-            env={**os.environ, APP_NAME_ENV: self.app_name},
+            env=env,
         )
+        set_attribute(current, "process.pid", process.pid)
+        return process
+
+    def run_controller(self) -> None:
+        """Run Cursor's controller, waiting after its startup span is exported."""
+        process = self.start_controller()
+        returncode = process.wait()
+        if returncode:
+            raise subprocess.CalledProcessError(returncode, process.args)

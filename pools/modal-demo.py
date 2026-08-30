@@ -4,15 +4,17 @@ Generated once by modal-cursor. This is application code and may be edited.
 """
 
 import modal
+import subprocess
 
 from modal_cursor import Pool
 from modal_cursor.spawn import spawn_worker
+from modal_cursor.telemetry import span
 
 CURSOR_SECRET_NAME = "cursor-service-account"
 WORKER_SECRET_NAMES = ()
 
 pool = Pool(
-    "modal-demo",
+    name="modal-demo",
     repo_url=None,
     scope="team",
     worker_ready_timeout_s=0,
@@ -24,6 +26,8 @@ cursor_secret = modal.Secret.from_name(
     CURSOR_SECRET_NAME,
     required_keys=["CURSOR_API_KEY"],
 )
+logfire_secret = modal.Secret.from_name("logfire-token", required_keys=["LOGFIRE_TOKEN"])
+controller_secrets = [cursor_secret, logfire_secret]
 worker_secrets = [modal.Secret.from_name(name) for name in WORKER_SECRET_NAMES]
 controller_image = pool.controller_image()
 
@@ -44,16 +48,25 @@ worker = pool.machine(
 
 @app.function(
     image=controller_image,
-    secrets=[cursor_secret],
+    secrets=controller_secrets,
     max_containers=1,
     retries=modal.Retries(max_retries=10),
     timeout=24 * 3600,
 )
 def controller() -> None:
-    pool.register()
-    pool.run_controller()
+    with span(
+        "modal_cursor.controller.invocation",
+        **{"modal_cursor.pool.name": pool.name, "modal_cursor.app.name": pool.app_name},
+    ):
+        pool.register()
+        process = pool.start_controller()
+    returncode = process.wait()
+    if returncode:
+        raise subprocess.CalledProcessError(returncode, process.args)
 
 
-@app.function(image=controller_image, secrets=[cursor_secret])
-def spawner(claim_env: dict[str, object]) -> str:
-    return spawn_worker(pool, worker, app, claim_env)
+@app.function(image=controller_image, secrets=controller_secrets)
+def spawner(
+    claim_env: dict[str, object], trace_carrier: dict[str, str] | None = None
+) -> str:
+    return spawn_worker(pool, worker, app, claim_env, trace_carrier)

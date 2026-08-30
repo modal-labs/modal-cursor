@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import subprocess
 from pathlib import Path
 from unittest.mock import Mock
 
@@ -75,18 +74,20 @@ def test_register_uses_pool_metadata(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_controller_uses_one_real_executable_path(monkeypatch: pytest.MonkeyPatch) -> None:
-    run = Mock(return_value=subprocess.CompletedProcess([], 0))
-    monkeypatch.setattr(pool_module.subprocess, "run", run)
+    process = Mock(pid=123, args=[])
+    start = Mock(return_value=process)
+    monkeypatch.setattr(pool_module.subprocess, "Popen", start)
     monkeypatch.setenv("CURSOR_API_KEY", "service-key")
 
-    Pool(name="gpu").run_controller()
+    Pool(name="gpu").start_controller()
 
-    argv = run.call_args.args[0]
+    argv = start.call_args.args[0]
     spawn_index = argv.index("--spawn") + 1
     assert argv[0] == "/root/.local/bin/agent"
     assert argv[spawn_index] == SPAWN_BRIDGE_PATH
     assert " " not in argv[spawn_index]
-    assert run.call_args.kwargs["env"][APP_NAME_ENV] == "modal-cursor-gpu"
+    assert start.call_args.kwargs["env"][APP_NAME_ENV] == "modal-cursor-gpu"
+    assert start.call_args.kwargs["env"]["traceparent"].startswith("00-")
 
 
 def test_spawn_bridge_source_is_an_executable_python_script() -> None:
@@ -96,3 +97,4 @@ def test_spawn_bridge_source_is_an_executable_python_script() -> None:
 
 def test_controller_image_declares_claim_validation_runtime() -> None:
     assert "pydantic-settings==2.15.0" in pool_module._CONTROLLER_DEPENDENCIES
+    assert "logfire[httpx]==4.41.0" in pool_module._CONTROLLER_DEPENDENCIES

@@ -46,7 +46,9 @@ requires-python = ">=3.11"
 dependencies = [
     "cyclopts>=4.20,<5",
     "httpx>=0.28.1,<1",
+    "logfire[httpx]>=4.41,<5",
     "modal>=1.5.4,<2",
+    "opentelemetry-api>=1.44,<2",
     "pydantic-settings>=2.15.0,<3",
     "rich>=13.6,<16",
 ]

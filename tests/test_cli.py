@@ -22,7 +22,9 @@ def _init(
     **kwargs: object,
 ) -> Path:
     monkeypatch.setattr(cli, "_interactive", lambda: False)
-    monkeypatch.setattr(cli, "_secret_names", lambda: {"cursor-service-account", "github-token"})
+    monkeypatch.setattr(
+        cli, "_secret_names", lambda: {"cursor-service-account", "github-token", "logfire-token"}
+    )
     cli.init_pool(name="demo-pool", pools_dir=tmp_path, **kwargs)
     return tmp_path / "demo-pool.py"
 
@@ -53,10 +55,12 @@ def test_init_generates_owned_single_pool_app(
     source = generated.read_text()
 
     assert "pool.register()" in source
-    assert "spawn_worker(pool, worker, app, claim_env)" in source
+    assert "modal_cursor.controller.invocation" in source
+    assert "spawn_worker(pool, worker, app, claim_env, trace_carrier)" in source
     assert "settings.controller_max_retries" in source
     assert namespace["pool"].worker_ready_timeout_s == 900
     assert namespace["CURSOR_SECRET_NAME"] == "cursor-service-account"
+    assert namespace["LOGFIRE_SECRET_NAME"] == "logfire-token"
     assert namespace["WORKER_SECRET_NAMES"] == ()
     assert namespace["app"].name == "modal-cursor-demo-pool"
 
@@ -73,7 +77,11 @@ def test_private_repo_configures_github_secret(
     namespace = runpy.run_path(str(generated))
     assert namespace["WORKER_SECRET_NAMES"] == ("github-token",)
     assert len(namespace["worker"].secrets) == 1
-    assert cli._required_secrets(generated) == {"cursor-service-account", "github-token"}
+    assert cli._required_secrets(generated) == {
+        "cursor-service-account",
+        "github-token",
+        "logfire-token",
+    }
 
 
 def test_init_rejects_invalid_repo_and_private_repo_without_url(

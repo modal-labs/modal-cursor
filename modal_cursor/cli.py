@@ -30,6 +30,7 @@ from modal_cursor.registry import (
     deregister_pool,
     list_pools,
 )
+from modal_cursor.telemetry import instrument, record_exception, set_attribute, span
 
 app = cyclopts.App(name="modal-cursor")
 TEMPLATE = files("modal_cursor").joinpath("templates", "pool.py.tmpl")
@@ -45,6 +46,9 @@ ApiEndpointOption = Annotated[str, cyclopts.Parameter(help="Base URL for the Cur
 ScopeOption = Annotated[Literal["team", "user"], cyclopts.Parameter(help="Cursor pool scope.")]
 SecretNameOption = Annotated[
     str, cyclopts.Parameter(help="Modal Secret containing CURSOR_API_KEY.")
+]
+LogfireSecretNameOption = Annotated[
+    str, cyclopts.Parameter(help="Modal Secret containing LOGFIRE_TOKEN.")
 ]
 PoolFileArg = Annotated[
     Path, cyclopts.Parameter(help="Generated pool file; omit to use --pools-dir.")
@@ -155,6 +159,7 @@ def _required_secrets(pool_file: Path) -> set[str]:
         target = node.targets[0]
         if not isinstance(target, ast.Name) or target.id not in {
             "CURSOR_SECRET_NAME",
+            "LOGFIRE_SECRET_NAME",
             "WORKER_SECRET_NAMES",
         }:
             continue
@@ -166,51 +171,82 @@ def _required_secrets(pool_file: Path) -> set[str]:
     worker_secrets = values.get("WORKER_SECRET_NAMES", ())
     if not isinstance(cursor_secret, str) or not cursor_secret:
         raise ConfigError(f"{pool_file}: CURSOR_SECRET_NAME is missing")
+    logfire_secret = values.get("LOGFIRE_SECRET_NAME")
+    if logfire_secret is not None and (not isinstance(logfire_secret, str) or not logfire_secret):
+        raise ConfigError(f"{pool_file}: LOGFIRE_SECRET_NAME is missing")
     if not isinstance(worker_secrets, (tuple, list)):
         raise ConfigError(f"{pool_file}: WORKER_SECRET_NAMES must be a sequence of names")
     raw_names = tuple(cast(Iterable[object], worker_secrets))
     names = tuple(name for name in raw_names if isinstance(name, str))
     if len(names) != len(raw_names) or not all(names):
         raise ConfigError(f"{pool_file}: WORKER_SECRET_NAMES must be a sequence of names")
-    return {cursor_secret, *names}
+    required = {cursor_secret, *names}
+    if isinstance(logfire_secret, str):
+        required.add(logfire_secret)
+    return required
 
 
 def _deploy_and_start(file: Path, pool: Pool) -> bool:
-    _console.print(f"Running modal deploy {file}...")
-    if _modal_deploy(file) != 0:
-        _error(f"{file} failed to deploy")
-        return False
-    try:
-        from_name = cast(Callable[[str, str], _ModalFunction], modal.Function.from_name)
-        from_name(pool.app_name, "controller").spawn()
-    except modal.exception.Error as error:
-        _error(f"Deployed {file}, but the controller failed to start: {error}")
-        return False
-    _ok(f"Deployed {file}; controller starting for pool {pool.name}")
-    return True
+    with span(
+        "modal_cursor.cli.deploy_pool",
+        **{
+            "modal_cursor.pool.name": pool.name,
+            "modal_cursor.pool.file": str(file),
+        },
+    ) as current:
+        _console.print(f"Running modal deploy {file}...")
+        if _modal_deploy(file) != 0:
+            set_attribute(current, "modal_cursor.outcome", "failure")
+            _error(f"{file} failed to deploy")
+            return False
+        try:
+            from_name = cast(Callable[[str, str], _ModalFunction], modal.Function.from_name)
+            from_name(pool.app_name, "controller").spawn()
+        except modal.exception.Error as error:
+            record_exception(current, error)
+            set_attribute(current, "modal_cursor.outcome", "failure")
+            _error(f"Deployed {file}, but the controller failed to start: {error}")
+            return False
+        _ok(f"Deployed {file}; controller starting for pool {pool.name}")
+        set_attribute(current, "modal_cursor.outcome", "success")
+        return True
 
 
 def _stop_modal_app(pool: Pool) -> bool:
     """Stop one app, treating an already-absent app as success."""
-    try:
-        modal.App.lookup(pool.app_name, create_if_missing=False)
-    except modal.exception.NotFoundError:
-        _ok(f"Modal app {pool.app_name} is not deployed")
+    with span(
+        "modal_cursor.cli.stop_app",
+        **{
+            "modal_cursor.pool.name": pool.name,
+            "modal_cursor.app.name": pool.app_name,
+        },
+    ) as current:
+        try:
+            modal.App.lookup(pool.app_name, create_if_missing=False)
+        except modal.exception.NotFoundError:
+            set_attribute(current, "modal_cursor.outcome", "already_absent")
+            _ok(f"Modal app {pool.app_name} is not deployed")
+            return True
+        except modal.exception.Error as error:
+            record_exception(current, error)
+            set_attribute(current, "modal_cursor.outcome", "failure")
+            _error(f"Could not inspect Modal app {pool.app_name}: {error}")
+            return False
+        try:
+            result = _modal("app", "stop", "--yes", pool.app_name)
+        except (OSError, subprocess.TimeoutExpired) as error:
+            record_exception(current, error)
+            set_attribute(current, "modal_cursor.outcome", "failure")
+            _error(f"Modal app {pool.app_name} stop failed: {error}")
+            return False
+        if result.returncode != 0:
+            set_attribute(current, "modal_cursor.outcome", "failure")
+            detail = (result.stderr or result.stdout).strip()
+            _error(f"Modal app {pool.app_name} stop failed: {detail or result.returncode}")
+            return False
+        _ok(f"Stopped Modal app {pool.app_name}")
+        set_attribute(current, "modal_cursor.outcome", "success")
         return True
-    except modal.exception.Error as error:
-        _error(f"Could not inspect Modal app {pool.app_name}: {error}")
-        return False
-    try:
-        result = _modal("app", "stop", "--yes", pool.app_name)
-    except (OSError, subprocess.TimeoutExpired) as error:
-        _error(f"Modal app {pool.app_name} stop failed: {error}")
-        return False
-    if result.returncode != 0:
-        detail = (result.stderr or result.stdout).strip()
-        _error(f"Modal app {pool.app_name} stop failed: {detail or result.returncode}")
-        return False
-    _ok(f"Stopped Modal app {pool.app_name}")
-    return True
 
 
 def _deregister_matches(
@@ -320,6 +356,7 @@ def _check_registry(
 
 
 @app.command
+@instrument("modal_cursor.cli.deploy")
 def deploy(
     pool_file: PoolFileArg | None = None,
     *,
@@ -345,6 +382,7 @@ def deploy(
 
 
 @app.command
+@instrument("modal_cursor.cli.destroy")
 def destroy(
     pool_file: PoolFileArg | None = None,
     *,
@@ -393,6 +431,7 @@ def destroy(
 
 
 @app.command(name="init")
+@instrument("modal_cursor.cli.init")
 def init_pool(  # noqa: PLR0912 - one linear CLI workflow with explicit user decisions
     name: PoolNameArg = "",
     *,
@@ -410,6 +449,7 @@ def init_pool(  # noqa: PLR0912 - one linear CLI workflow with explicit user dec
     ] = 0,
     api_endpoint: ApiEndpointOption = DEFAULT_API_ENDPOINT,
     secret_name: SecretNameOption = "cursor-service-account",
+    logfire_secret_name: LogfireSecretNameOption = "logfire-token",
     pools_dir: PoolsDirOption = Path("pools"),
     deploy: Annotated[
         bool | None, cyclopts.Parameter(help="Deploy after generating the file.")
@@ -426,6 +466,8 @@ def init_pool(  # noqa: PLR0912 - one linear CLI workflow with explicit user dec
         name = _ask("Pool name")
     if not secret_name.strip():
         raise SystemExit("secret_name must not be empty")
+    if not logfire_secret_name.strip():
+        raise SystemExit("logfire_secret_name must not be empty")
     if private_repo and not repo_url:
         raise SystemExit("--private-repo requires --repo-url")
     if private_repo and not github_secret_name.strip():
@@ -461,6 +503,7 @@ def init_pool(  # noqa: PLR0912 - one linear CLI workflow with explicit user dec
         pool_options=pool_options,
         app_name=repr(pool.app_name),
         secret_name=repr(secret_name),
+        logfire_secret_name=repr(logfire_secret_name),
         worker_secret_names=repr(worker_secret_names),
     )
     try:
@@ -484,6 +527,11 @@ def init_pool(  # noqa: PLR0912 - one linear CLI workflow with explicit user dec
         interactive=interactive,
         value=os.environ.get("CURSOR_API_KEY"),
     )
+    if logfire_secret_name not in existing_secrets:
+        _warn(
+            f"Modal Secret {logfire_secret_name!r} is missing; create it with a LOGFIRE_TOKEN "
+            "before deploying to export telemetry"
+        )
     if private_repo:
         _ensure_modal_secret(
             name=github_secret_name,
@@ -506,6 +554,7 @@ def init_pool(  # noqa: PLR0912 - one linear CLI workflow with explicit user dec
 
 
 @app.command
+@instrument("modal_cursor.cli.doctor")
 def doctor(
     *,
     pools_dir: PoolsDirOption = Path("pools"),

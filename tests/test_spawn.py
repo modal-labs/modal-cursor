@@ -86,6 +86,7 @@ def test_bridge_waits_for_remote_provisioning_without_forwarding_key(
 
     payload = spawner.remote.call_args.args[0]
     assert payload["pool"] == "gpu"
+    assert "traceparent" in spawner.remote.call_args.args[1]
     assert "api_key" not in payload
     assert "long-lived-service-key" not in repr(payload)
     assert not spawner.spawn.called

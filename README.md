@@ -85,6 +85,44 @@ Runtime tuning is available through the optional `MODAL_CURSOR_SANDBOX_TIMEOUT_S
 `MODAL_CURSOR_WORKER_POLL_INTERVAL_S`, `MODAL_CURSOR_CONTROLLER_TIMEOUT_S`, and
 `MODAL_CURSOR_CONTROLLER_MAX_RETRIES` environment variables.
 
+## Observability
+
+Lifecycle spans and Cursor API request spans are emitted with
+[Pydantic Logfire](https://logfire.pydantic.dev/). Set `LOGFIRE_TOKEN` in the
+`logfire-token` Modal Secret (or pass another name with
+`modal-cursor init --logfire-secret-name`) to send them to Logfire; without a
+token, instrumentation is quiet and has no effect on pool operation. The
+default service name is `modal-cursor` and can be changed with
+`LOGFIRE_SERVICE_NAME`.
+Spans include pool, request, worker, sandbox, and outcome metadata, but never
+Cursor API keys, Modal Secrets, or complete claim/machine payloads.
+
+The important cold-start trace is intentionally shaped around the business
+lifecycle rather than the implementation details:
+
+```text
+modal_cursor.controller.invocation
+└─ modal_cursor.controller.run
+   └─ modal_cursor.controller.dispatch       # Cursor claimed request → bridge
+      └─ modal_cursor.modal.spawner.invoke   # bridge → Modal Function
+         └─ modal_cursor.worker.provision
+            ├─ modal_cursor.worker.create_sandbox
+            └─ modal_cursor.worker.wait_for_ready
+               ├─ GET 404                         # not visible to Cursor yet
+               └─ GET 200                         # worker connected
+```
+
+Cursor's controller is a closed-source subprocess, so queue discovery and the
+exact claim-selection decision cannot be instrumented from this package. The
+`controller.dispatch` span is the reliable boundary: its presence means
+Cursor has already claimed a concrete request and invoked the bridge. W3C
+trace context is propagated through the bridge process and into the Modal
+spawner so the semantic spans remain one trace. The controller is intentionally
+started outside the long-lived `process.wait()` call: OpenTelemetry exports
+spans when they end, so keeping `controller.invocation` or `controller.run`
+open for the controller's entire lifetime would hide the parent spans and make
+the trace appear unstructured until shutdown.
+
 ## Operations
 
 `modal-cursor doctor` checks more than object existence. It verifies Modal

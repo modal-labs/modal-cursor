@@ -118,6 +118,8 @@ def test_worker_connection_requires_matching_live_worker() -> None:
         pytest.raises(RegistrySchemaError, match="workerId"),
     ):
         worker_connected(client, "pw-1")
+    with _client(lambda request: httpx.Response(200, json={"workerId": "pw-1"})) as client:
+        assert worker_connected(client, "pw-1")
 
 
 @pytest.mark.parametrize(
