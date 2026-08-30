@@ -97,33 +97,40 @@ default service name is `modal-cursor` and can be changed with
 Spans include pool, request, worker, sandbox, and outcome metadata, but never
 Cursor API keys, Modal Secrets, or complete claim/machine payloads.
 
-The important cold-start trace is intentionally shaped around the business
-lifecycle rather than the implementation details:
+The controller startup trace is intentionally separate from each request
+trace. The startup context is linked from the request trace, but it is not a
+parent because one long-lived controller handles many requests:
 
 ```text
+Controller startup trace:
 modal_cursor.controller.invocation
+├─ modal_cursor.pool.register
 └─ modal_cursor.controller.run
-   └─ modal_cursor.controller.dispatch       # Cursor claimed request → bridge
-      └─ modal_cursor.modal.spawner.invoke   # bridge → Modal Function
-         └─ modal_cursor.worker.provision
-            ├─ modal_cursor.worker.create_sandbox
-            └─ modal_cursor.worker.wait_for_cursor_registration
-               ├─ modal_cursor.worker.readiness.poll # attempt=1, not_ready
-               │  └─ GET 404                       # not visible to Cursor yet
-               └─ modal_cursor.worker.readiness.poll # attempt=2, ready
-                  └─ GET 200                     # worker connected
+
+Per-request trace:
+modal_cursor.controller.dispatch       # Cursor claimed request → bridge
+└─ modal_cursor.modal.spawner.invoke   # bridge → Modal Function
+   └─ modal_cursor.worker.provision
+      ├─ modal_cursor.worker.create_sandbox
+      └─ modal_cursor.worker.wait_for_cursor_registration
+         ├─ modal_cursor.worker.readiness.poll # attempt=1, not_ready
+         │  └─ GET 404                       # not visible to Cursor yet
+         └─ modal_cursor.worker.readiness.poll # attempt=2, ready
+            └─ GET 200                     # worker connected
 ```
 
 Cursor's controller is a closed-source subprocess, so queue discovery and the
 exact claim-selection decision cannot be instrumented from this package. The
 `controller.dispatch` span is the reliable boundary: its presence means
-Cursor has already claimed a concrete request and invoked the bridge. W3C
-trace context is propagated through the bridge process and into the Modal
-spawner so the semantic spans remain one trace. The controller is intentionally
-started outside the long-lived `process.wait()` call: OpenTelemetry exports
-spans when they end, so keeping `controller.invocation` or `controller.run`
-open for the controller's entire lifetime would hide the parent spans and make
-the trace appear unstructured until shutdown.
+Cursor has already claimed a concrete request and invoked the bridge. Each
+bridge invocation starts a fresh trace; its downstream Modal spans remain in
+that trace via W3C propagation. The controller-startup context is retained as
+a span link, never reused as a parent, because the same long-lived controller
+process invokes the bridge for many independent requests. The controller is
+intentionally started outside the long-lived `process.wait()` call:
+OpenTelemetry exports spans when they end, so keeping `controller.invocation`
+or `controller.run` open for the controller's entire lifetime would hide the
+parent spans and make the trace appear unstructured until shutdown.
 Readiness spans record whether the sandbox process remained alive, whether
 registration was pending, the poll count, the registration outcome, and the
 registration elapsed time. Each readiness poll remains a child span, making

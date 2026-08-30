@@ -139,6 +139,43 @@ def continue_trace(carrier: Mapping[str, str]) -> Generator[None, None, None]:
         context.detach(token)
 
 
+@contextmanager
+def new_root_span(
+    carrier: Mapping[str, str], name: str, /, **attributes: object
+) -> Generator[Any, None, None]:
+    """Start an independent trace and link it to an inherited startup context.
+
+    Cursor invokes the bridge repeatedly from one long-lived controller process.
+    Its inherited ``traceparent`` identifies controller startup, not an
+    individual request, so using it as a parent would merge unrelated jobs into
+    one trace. A span link preserves navigability without violating trace
+    boundaries.
+    """
+    configure_telemetry()
+    if _state.disabled:
+        yield None
+        return
+
+    linked_span_context = None
+    try:
+        inherited = propagate.extract(carrier)
+        candidate = trace.get_current_span(inherited).get_span_context()
+        if candidate.is_valid:
+            linked_span_context = candidate
+    except (AttributeError, TypeError, ValueError):
+        pass
+
+    token = context.attach(Context())
+    try:
+        links: tuple[tuple[Any, dict[str, str]], ...] = ()
+        if linked_span_context is not None:
+            links = ((linked_span_context, {"modal_cursor.link.type": "controller_startup"}),)
+        with span(name, _links=links, **attributes) as current:
+            yield current
+    finally:
+        context.detach(token)
+
+
 def flush_telemetry(timeout_millis: int = 10_000) -> bool:
     """Flush spans before a short-lived bridge or Modal invocation exits."""
     configure_telemetry()

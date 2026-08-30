@@ -32,6 +32,7 @@ from modal_cursor.telemetry import (
     flush_at_exit,
     inject_trace_context,
     instrument,
+    new_root_span,
     record_exception,
     set_attribute,
     span,
@@ -209,8 +210,7 @@ def main() -> int:
 
     with (
         flush_at_exit(),
-        continue_trace(os.environ),
-        span("modal_cursor.controller.dispatch") as current,
+        new_root_span(os.environ, "modal_cursor.controller.dispatch") as current,
     ):
         try:
             claim = Claim()  # pyright: ignore[reportCallIssue]
