@@ -27,7 +27,6 @@ from modal_cursor.registry import (
     worker_connected,
 )
 from modal_cursor.telemetry import (
-    add_event,
     continue_trace,
     current_span,
     flush_at_exit,
@@ -54,8 +53,8 @@ class WorkerProvisioningError(RuntimeError):
     """A sandbox failed to connect its claimed Cursor worker."""
 
 
-@instrument("modal_cursor.worker.wait_for_ready")
-def _wait_for_worker_ready(
+@instrument("modal_cursor.worker.wait_for_cursor_registration")
+def _wait_for_cursor_registration(
     sandbox: modal.Sandbox,
     client: httpx.Client,
     worker_id: str,
@@ -78,25 +77,17 @@ def _wait_for_worker_ready(
         attempt += 1
         returncode = sandbox.poll()
         if returncode is not None:
-            add_event(
-                current,
-                "modal_cursor.worker.process_exited",
-                {"modal_cursor.worker.poll.attempt": attempt, "process.exit.code": returncode},
-            )
+            set_attribute(current, "modal_cursor.worker.process_alive", False)
+            set_attribute(current, "modal_cursor.worker.poll.count", attempt)
+            set_attribute(current, "modal_cursor.worker.registration_outcome", "process_exited")
+            set_attribute(current, "process.exit.code", returncode)
             raise WorkerProvisioningError(
                 f"sandbox {sandbox.object_id} exited with status {returncode} "
                 "before worker connected"
             )
         if not process_alive_recorded:
             process_alive_recorded = True
-            add_event(
-                current,
-                "modal_cursor.worker.sandbox_process_alive",
-                {
-                    "modal_cursor.worker.poll.attempt": attempt,
-                    "modal_cursor.worker.elapsed_ms": round((time.monotonic() - started_at) * 1000),
-                },
-            )
+            set_attribute(current, "modal_cursor.worker.process_alive", True)
         with span(
             "modal_cursor.worker.readiness.poll",
             **{"modal_cursor.worker.poll.attempt": attempt},
@@ -108,36 +99,33 @@ def _wait_for_worker_ready(
                 "modal_cursor.worker.poll.outcome",
                 "ready" if ready else "not_ready",
             )
+            set_attribute(
+                poll_span,
+                "modal_cursor.worker.poll.elapsed_ms",
+                round((time.monotonic() - started_at) * 1000),
+            )
         if ready:
             set_attribute(current, "modal_cursor.worker.ready", True)
             set_attribute(current, "modal_cursor.worker.poll.count", attempt)
-            add_event(
+            set_attribute(current, "modal_cursor.worker.registration_outcome", "ready")
+            set_attribute(
                 current,
-                "modal_cursor.worker.registration_succeeded",
-                {
-                    "modal_cursor.worker.poll.attempt": attempt,
-                    "modal_cursor.worker.elapsed_ms": round((time.monotonic() - started_at) * 1000),
-                },
+                "modal_cursor.worker.registration_elapsed_ms",
+                round((time.monotonic() - started_at) * 1000),
             )
             return
         if not registration_pending_recorded:
             registration_pending_recorded = True
-            add_event(
-                current,
-                "modal_cursor.worker.registration_pending",
-                {"modal_cursor.worker.poll.attempt": attempt},
-            )
+            set_attribute(current, "modal_cursor.worker.registration_pending", True)
         if time.monotonic() >= deadline:
             sandbox.terminate()
             set_attribute(current, "modal_cursor.worker.ready", False)
             set_attribute(current, "modal_cursor.worker.poll.count", attempt)
-            add_event(
+            set_attribute(current, "modal_cursor.worker.registration_outcome", "timeout")
+            set_attribute(
                 current,
-                "modal_cursor.worker.registration_timeout",
-                {
-                    "modal_cursor.worker.poll.attempt": attempt,
-                    "modal_cursor.worker.elapsed_ms": round((time.monotonic() - started_at) * 1000),
-                },
+                "modal_cursor.worker.registration_elapsed_ms",
+                round((time.monotonic() - started_at) * 1000),
             )
             raise WorkerProvisioningError(
                 f"sandbox {sandbox.object_id} did not connect worker within {timeout_s:g}s"
@@ -195,7 +183,7 @@ def _provision_worker(
         set_attribute(create_span, "modal_cursor.sandbox.id", sandbox.object_id)
     endpoint = os.environ.get("CURSOR_API_ENDPOINT", pool.api_endpoint)
     with cursor_client(endpoint, api_key) as client:
-        _wait_for_worker_ready(sandbox, client, claim.agent_worker_id)
+        _wait_for_cursor_registration(sandbox, client, claim.agent_worker_id)
     set_attribute(current, "modal_cursor.sandbox.id", sandbox.object_id)
     print(
         f"[spawn] pool={claim.pool} worker={claim.agent_worker_id} "
@@ -261,7 +249,6 @@ def main() -> int:
             ) as invoke_span:
                 trace_carrier: dict[str, str] = {}
                 inject_trace_context(trace_carrier)
-                add_event(invoke_span, "modal_cursor.modal.remote_call_dispatched")
                 remote_started_at = time.monotonic()
                 sandbox_id = spawner.remote(claim.payload(), trace_carrier)
                 set_attribute(invoke_span, "modal_cursor.sandbox.id", sandbox_id)
@@ -270,11 +257,6 @@ def main() -> int:
                     invoke_span,
                     "modal_cursor.modal.remote_call.elapsed_ms",
                     remote_elapsed_ms,
-                )
-                add_event(
-                    invoke_span,
-                    "modal_cursor.modal.remote_call_completed",
-                    {"modal_cursor.modal.remote_call.elapsed_ms": remote_elapsed_ms},
                 )
         except modal.exception.Error as error:
             record_exception(current, error)

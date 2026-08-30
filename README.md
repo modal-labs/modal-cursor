@@ -107,7 +107,7 @@ modal_cursor.controller.invocation
       └─ modal_cursor.modal.spawner.invoke   # bridge → Modal Function
          └─ modal_cursor.worker.provision
             ├─ modal_cursor.worker.create_sandbox
-            └─ modal_cursor.worker.wait_for_ready
+            └─ modal_cursor.worker.wait_for_cursor_registration
                ├─ modal_cursor.worker.readiness.poll # attempt=1, not_ready
                │  └─ GET 404                       # not visible to Cursor yet
                └─ modal_cursor.worker.readiness.poll # attempt=2, ready
@@ -124,11 +124,12 @@ started outside the long-lived `process.wait()` call: OpenTelemetry exports
 spans when they end, so keeping `controller.invocation` or `controller.run`
 open for the controller's entire lifetime would hide the parent spans and make
 the trace appear unstructured until shutdown.
-Readiness spans also emit lifecycle events for the first observed live sandbox
-process, pending registration, successful registration, process exit, and
-timeout. The Modal remote-call span records dispatch and completion events so
-the interval before the spawner function begins is visible as remote invocation
-startup/scheduling time rather than an unexplained missing operation.
+Readiness spans record whether the sandbox process remained alive, whether
+registration was pending, the poll count, the registration outcome, and the
+registration elapsed time. Each readiness poll remains a child span, making
+the interval before the spawner function begins visible as remote invocation
+startup/scheduling time without turning routine state transitions into extra
+records.
 
 ## Operations
 

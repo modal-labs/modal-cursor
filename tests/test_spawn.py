@@ -35,7 +35,7 @@ def test_spawn_worker_provisions_sandbox_from_one_machine(
     create = Mock(return_value=SimpleNamespace(object_id="sb-1"))
     monkeypatch.setattr(modal.Sandbox, "create", create)
     ready = Mock()
-    monkeypatch.setattr(spawn_module, "_wait_for_worker_ready", ready)
+    monkeypatch.setattr(spawn_module, "_wait_for_cursor_registration", ready)
     monkeypatch.setenv("CURSOR_API_KEY", "long-lived-service-key")
 
     sandbox_id = spawn_module.spawn_worker(pool, worker, "app", CLAIM_PAYLOAD)
@@ -53,7 +53,7 @@ def test_worker_readiness_detects_early_exit_and_timeout(
 ) -> None:
     exited = SimpleNamespace(object_id="sb-exited", poll=Mock(return_value=127))
     with pytest.raises(spawn_module.WorkerProvisioningError, match="status 127"):
-        spawn_module._wait_for_worker_ready(exited, Mock(), "pw-1")
+        spawn_module._wait_for_cursor_registration(exited, Mock(), "pw-1")
 
     timed_out = SimpleNamespace(
         object_id="sb-timeout",
@@ -62,7 +62,7 @@ def test_worker_readiness_detects_early_exit_and_timeout(
     )
     monkeypatch.setattr(spawn_module, "worker_connected", lambda client, worker_id: False)
     with pytest.raises(spawn_module.WorkerProvisioningError, match="did not connect"):
-        spawn_module._wait_for_worker_ready(timed_out, Mock(), "pw-1", timeout_s=0)
+        spawn_module._wait_for_cursor_registration(timed_out, Mock(), "pw-1", timeout_s=0)
     timed_out.terminate.assert_called_once_with()
 
 
@@ -73,7 +73,7 @@ def test_worker_readiness_records_semantic_poll_spans(
     monkeypatch.setattr(spawn_module, "worker_connected", Mock(side_effect=[False, True]))
     monkeypatch.setattr(spawn_module.time, "sleep", Mock())
 
-    spawn_module._wait_for_worker_ready(sandbox, Mock(), "pw-ready")
+    spawn_module._wait_for_cursor_registration(sandbox, Mock(), "pw-ready")
 
     exported = [
         item
@@ -85,6 +85,12 @@ def test_worker_readiness_records_semantic_poll_spans(
         "not_ready",
         "ready",
     ]
+    readiness = next(
+        item for item in exported if item.name == "modal_cursor.worker.wait_for_cursor_registration"
+    )
+    assert readiness.attributes["modal_cursor.worker.process_alive"] is True
+    assert readiness.attributes["modal_cursor.worker.registration_pending"] is True
+    assert readiness.attributes["modal_cursor.worker.registration_outcome"] == "ready"
 
 
 def test_spawn_worker_rejects_cross_pool_claim() -> None:
