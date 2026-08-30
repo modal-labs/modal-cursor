@@ -97,10 +97,11 @@ class Pool(BaseModel):
 
     @model_validator(mode="after")
     def _valid_values(self) -> Pool:
-        if self.worker_ready_timeout_s < 0:
+        if self.worker_ready_timeout_s != 0:
             raise PydanticCustomError(
-                "pool_worker_ready_timeout_s_must_be_non_negative",
-                "worker_ready_timeout_s must be zero or greater",
+                "pool_worker_ready_timeout_s_requires_snapshot_restore",
+                "worker_ready_timeout_s must be zero; snapshot/restore hibernation "
+                "is not supported",
             )
         return self
 

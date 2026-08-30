@@ -184,19 +184,28 @@ def build_entrypoint(pool_name: str, claim: Claim, default_repo_url: str | None)
 
     lines = ["set -euo pipefail"]
     args = [CURSOR_AGENT_PATH, "worker", "--pool", shlex.quote(pool_name)]
+    credential_helper = (
+        '!f() { printf "username=x-access-token\\npassword=%s\\n" "$GITHUB_TOKEN"; }; f'
+    )
+    credential_config = shlex.quote(f"credential.helper={credential_helper}")
     if claim.worker_name:
         args += ["--name", shlex.quote(claim.worker_name)]
     if urls:
         lines.append(f"mkdir -p {WORKSPACE}")
         for url, destination in zip(urls, destinations, strict=True):
             checkout = f"{WORKSPACE}/{destination}"
-            tokenized_url = 'URL="https://x-access-token:${GITHUB_TOKEN}@${URL#https://}"'
             lines.append(
                 f"URL={shlex.quote(url)}; "
-                f'[ -n "${{GITHUB_TOKEN:-}}" ] && {tokenized_url}; '
-                f'git clone --depth 50 "$URL" {shlex.quote(checkout)}'
+                f'if [ -n "${{GITHUB_TOKEN:-}}" ]; then '
+                "git -c credential.helper= -c "
+                f"{credential_config} "
+                f'clone --depth 50 "$URL" {shlex.quote(checkout)}; '
+                f'else git clone --depth 50 "$URL" {shlex.quote(checkout)}; fi'
             )
             args += ["--worker-dir", shlex.quote(checkout)]
+        # The token is needed only by the clone helper. Do not expose it to
+        # the Cursor agent or leave it available for subsequent tool calls.
+        lines.append("unset GITHUB_TOKEN")
     lines.append(f"exec {' '.join(args)} start")
     return "bash", "-lc", "\n".join(lines)
 

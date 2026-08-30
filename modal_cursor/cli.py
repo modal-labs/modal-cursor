@@ -350,22 +350,42 @@ def _check_registry(
     scope: PoolScope,
 ) -> int:
     failures = 0
-    local_names = {pool.name for _, pool in local_pools}
+    local_identities = {(pool.name, pool.scope, pool.repo_url) for _, pool in local_pools}
     by_name: dict[str, list[RegisteredPool]] = {}
     for item in registry:
         if item.scope == scope:
             by_name.setdefault(item.name, []).append(item)
-    for name in sorted(by_name.keys() - local_names):
-        _error(f"Cursor pool {name} is registered but has no local pool file")
-        failures += 1
+    for item in registry:
+        if item.scope != scope:
+            continue
+        identity = (item.name, item.scope, item.repository.url if item.repository else None)
+        if identity not in local_identities:
+            _error(f"Cursor pool {item.name} is registered but has no matching local pool file")
+            failures += 1
     for pool_file, pool in local_pools:
-        matches = by_name.get(pool.name, [])
+        matches = [
+            item
+            for item in by_name.get(pool.name, [])
+            if (item.repository.url if item.repository else None) == pool.repo_url
+        ]
         if not matches:
-            _error(f"{pool_file} is not registered with Cursor")
+            _error(f"{pool_file} is not registered with matching repository metadata")
             failures += 1
             continue
-        connected = sum(item.connected_workers for item in matches)
-        in_use = sum(item.in_use_workers for item in matches)
+        if len(matches) > 1:
+            _error(f"Cursor pool {pool.name} has duplicate matching registrations")
+            failures += 1
+            continue
+        registered = matches[0]
+        if registered.worker_ready_timeout_s != pool.worker_ready_timeout_s:
+            _error(
+                f"Cursor pool {pool.name} has workerReadyTimeoutSeconds="
+                f"{registered.worker_ready_timeout_s}; expected {pool.worker_ready_timeout_s}"
+            )
+            failures += 1
+            continue
+        connected = registered.connected_workers
+        in_use = registered.in_use_workers
         _ok(f"Cursor pool {pool.name}: {connected} connected, {in_use} in use")
     return failures
 
@@ -450,9 +470,6 @@ def init_pool(  # noqa: PLR0912 - one linear CLI workflow with explicit user dec
         cyclopts.Parameter(help="Modal Secret containing GITHUB_TOKEN for a private repository."),
     ] = "github-token",
     scope: ScopeOption = "team",
-    worker_ready_timeout_s: Annotated[
-        int, cyclopts.Parameter(help="Seconds Cursor waits for an offline worker to reconnect.")
-    ] = 0,
     api_endpoint: ApiEndpointOption = DEFAULT_API_ENDPOINT,
     secret_name: SecretNameOption = "cursor-service-account",
     logfire_secret_name: LogfireSecretNameOption = "logfire-token",
@@ -484,7 +501,6 @@ def init_pool(  # noqa: PLR0912 - one linear CLI workflow with explicit user dec
             name=name,
             repo_url=repo_url or None,
             scope=scope,
-            worker_ready_timeout_s=worker_ready_timeout_s,
             api_endpoint=api_endpoint,
         )
     except (ConfigError, ValidationError) as error:
@@ -499,7 +515,6 @@ def init_pool(  # noqa: PLR0912 - one linear CLI workflow with explicit user dec
         for name, value, default in (
             ("repo_url", pool.repo_url, None),
             ("scope", pool.scope, "team"),
-            ("worker_ready_timeout_s", pool.worker_ready_timeout_s, 0),
             ("api_endpoint", pool.api_endpoint, DEFAULT_API_ENDPOINT),
         )
         if value != default

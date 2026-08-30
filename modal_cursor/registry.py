@@ -31,10 +31,11 @@ class PendingRequest(BaseModel):
     request_id: str
     pool: str
     repo_url: str | None = None
+    repo_urls: tuple[str, ...] = ()
     claimed_worker_id: str | None = None
 
     @classmethod
-    def from_payload(cls, value: object) -> PendingRequest:
+    def from_payload(cls, value: object) -> PendingRequest:  # noqa: PLR0912 - schema validation
         if not isinstance(value, Mapping):
             raise RegistrySchemaError("Cursor pending request is not an object")
         raw = cast(Mapping[str, object], value)
@@ -60,6 +61,19 @@ class PendingRequest(BaseModel):
             raise RegistrySchemaError(
                 f"Cursor pending request {request_id!r} has an invalid repoUrl"
             )
+        raw_repo_urls = raw.get("repoUrls")
+        repo_urls: tuple[str, ...]
+        if raw_repo_urls is None:
+            repo_urls = ()
+        elif not isinstance(raw_repo_urls, list):
+            raise RegistrySchemaError(f"Cursor pending request {request_id!r} has invalid repoUrls")
+        else:
+            repo_values = cast(list[object], raw_repo_urls)
+            if any(not isinstance(url, str) or not url for url in repo_values):
+                raise RegistrySchemaError(
+                    f"Cursor pending request {request_id!r} has invalid repoUrls"
+                )
+            repo_urls = tuple(cast(str, url) for url in repo_values)
         claimed_worker_id = raw.get("claimedWorkerId")
         if claimed_worker_id is not None and not isinstance(claimed_worker_id, str):
             raise RegistrySchemaError(
@@ -69,6 +83,7 @@ class PendingRequest(BaseModel):
             request_id=request_id,
             pool=pool,
             repo_url=repo_url,
+            repo_urls=repo_urls,
             claimed_worker_id=claimed_worker_id,
         )
 
@@ -80,7 +95,7 @@ class PendingRequest(BaseModel):
             "request_id": self.request_id,
             "worker_name": None,
             "repo_url": self.repo_url,
-            "repo_urls": (),
+            "repo_urls": self.repo_urls,
         }
 
 
@@ -94,7 +109,7 @@ class PendingRequestEvent(BaseModel):
     request: PendingRequest | None = None
 
 
-def _pending_requests_payload(value: object) -> tuple[list[PendingRequest], str]:
+def _pending_requests_payload(value: object) -> tuple[list[PendingRequest], str, str | None]:
     if not isinstance(value, Mapping):
         raise RegistrySchemaError("Cursor pending-request response is not an object")
     raw = cast(Mapping[str, object], value)
@@ -104,7 +119,14 @@ def _pending_requests_payload(value: object) -> tuple[list[PendingRequest], str]
         raise RegistrySchemaError(
             "Cursor pending-request response is missing requests or streamCursor"
         )
-    return [PendingRequest.from_payload(item) for item in cast(list[object], requests)], cursor
+    next_page = raw.get("nextPageToken")
+    if next_page is not None and (not isinstance(next_page, str) or not next_page):
+        raise RegistrySchemaError("Cursor pending-request response has an invalid nextPageToken")
+    return (
+        [PendingRequest.from_payload(item) for item in cast(list[object], requests)],
+        cursor,
+        next_page,
+    )
 
 
 class Repository(BaseModel):
@@ -295,11 +317,24 @@ def list_pools(client: httpx.Client) -> list[RegisteredPool]:
 @instrument("modal_cursor.registry.list_pending_requests")
 def list_pending_requests(client: httpx.Client) -> tuple[list[PendingRequest], str]:
     """List pending requests across every pool visible to this service account."""
-    response = client.get("/v0/private-workers/pending-requests")
-    set_attribute(current_span(), "http.response.status_code", response.status_code)
-    response.raise_for_status()
-    requests, cursor = _pending_requests_payload(response.json())
+    requests: list[PendingRequest] = []
+    cursor: str | None = None
+    page_token: str | None = None
+    while True:
+        params = {"pageToken": page_token} if page_token else None
+        response = client.get("/v0/private-workers/pending-requests", params=params)
+        set_attribute(current_span(), "http.response.status_code", response.status_code)
+        response.raise_for_status()
+        page_requests, page_cursor, page_token = _pending_requests_payload(response.json())
+        if cursor is None:
+            cursor = page_cursor
+        elif cursor != page_cursor:
+            raise RegistrySchemaError("Cursor pending-request pages have different stream cursors")
+        requests.extend(page_requests)
+        if page_token is None:
+            break
     set_attribute(current_span(), "modal_cursor.pending_request.count", len(requests))
+    assert cursor is not None
     return requests, cursor
 
 

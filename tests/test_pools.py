@@ -115,6 +115,10 @@ def test_repo_entrypoint_clones_then_starts_worker() -> None:
     assert command[:2] == ("bash", "-lc")
     assert "git clone --depth 50" in command[2]
     assert "GITHUB_TOKEN" in command[2]
+    assert "x-access-token:${" not in command[2]
+    assert "git -c credential.helper= -c" in command[2]
+    assert "credential.helper" in command[2]
+    assert "unset GITHUB_TOKEN" in command[2]
     assert "exec /root/.local/bin/agent worker" in command[2]
     assert "--worker-dir /workspace/payments" in command[2]
 

@@ -25,14 +25,15 @@ For a repository-scoped pool:
 
 ```bash
 uv run modal-cursor init payments \
-  --repo-url https://github.com/acme/payments \
-  --worker-ready-timeout-s 900
+  --repo-url https://github.com/acme/payments
 ```
 
 Add `--private-repo` to configure a worker-side Modal secret containing
-`GITHUB_TOKEN`. Only HTTPS `github.com/<owner>/<repo>` URLs are accepted;
-unsupported repository hosts fail during configuration instead of during a
-worker launch.
+`GITHUB_TOKEN`. The token is used by a temporary Git credential helper during
+clone and is removed before the Cursor worker starts; it is not written into
+the repository remote URL. Only HTTPS `github.com/<owner>/<repo>` URLs are
+accepted; unsupported repository hosts fail during configuration instead of
+during a worker launch.
 
 Destroying a pool stops the shared Modal control plane and uses the live Cursor
 registry record—including `repo_owner` and `repo_name` for repository-scoped
@@ -61,10 +62,12 @@ Modal sandbox. The provisioner monitors the sandbox until Cursor exposes the
 claimed worker ID, failing on an early sandbox exit or readiness timeout; a
 failed claim is released for retry.
 
-The generated controller registers `workerReadyTimeoutSeconds`, the current
-Cursor reconnect-window field. The controller image installs a versioned,
-SHA-256-verified Cursor CLI lab-channel archive instead of executing an
-unpinned remote install script.
+This deployment uses ephemeral Modal sandboxes, so it registers
+`workerReadyTimeoutSeconds=0`: follow-ups reacquire on a fresh sandbox after a
+worker exits. Snapshot/restore hibernation is not supported; nonzero reconnect
+windows are rejected during configuration. The controller image installs a
+versioned, SHA-256-verified Cursor CLI lab-channel archive instead of
+executing an unpinned remote install script.
 
 ## Credentials
 
@@ -74,10 +77,10 @@ credential. Store it in a Modal Secret (the generated default is
 of that credential's trust boundary.
 
 The controller receives this key from its Modal Secret and injects it directly
-into the worker environment because the Cursor worker CLI requires it. Private repository
-credentials are separate: workers receive
-`GITHUB_TOKEN` only when their generated configuration includes the requested
-GitHub Modal Secret.
+into the worker environment because the Cursor worker CLI requires it. Private
+repository credentials are separate: the clone shell receives `GITHUB_TOKEN`
+only when its generated configuration includes the requested GitHub Modal
+Secret, and unsets it before launching the Cursor agent.
 
 Runtime tuning is available through the optional `MODAL_CURSOR_SANDBOX_TIMEOUT_S`,
 `MODAL_CURSOR_IDLE_RELEASE_TIMEOUT_S`, `MODAL_CURSOR_SPAWNER_READY_TIMEOUT_S`,
@@ -179,9 +182,8 @@ uv build
 ```
 
 The test suite is self-contained; it has no sibling path dependency. The
-separate `cursor-mock` repository mirrors the current
-`workerReadyTimeoutSeconds` and repository-aware deregistration contracts for
-larger integration tests.
+separate `cursor-mock` repository mirrors the current repository-aware
+deregistration contract for larger integration tests.
 
 Unit tests mock Modal and Cursor network boundaries. They do not prove that a
 new Cursor CLI release can enroll and serve a real agent. Before a production

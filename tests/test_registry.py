@@ -92,6 +92,23 @@ def _pending_payload(request_id: str = "bc-1", pool: str = "payments") -> dict[s
     }
 
 
+def test_pending_request_preserves_multi_repo_metadata() -> None:
+    request = PendingRequest.from_payload(
+        {
+            **_pending_payload(),
+            "repoUrls": [
+                "https://github.com/acme/payments",
+                "https://github.com/acme/infra",
+            ],
+        }
+    )
+    assert request.repo_urls == (
+        "https://github.com/acme/payments",
+        "https://github.com/acme/infra",
+    )
+    assert request.claim_payload("worker-1")["repo_urls"] == request.repo_urls
+
+
 def test_pending_request_routes_by_pool_and_keeps_claim_payload_secret_free() -> None:
     request = PendingRequest.from_payload(_pending_payload())
     assert request.pool == "payments"
@@ -137,6 +154,33 @@ def test_pending_request_list_is_unfiltered_and_sse_is_cursor_based() -> None:
     assert events[1].request is None
     assert requests[0].url.params == httpx.QueryParams()
     assert requests[1].url.params["cursor"] == "cursor-1"
+
+
+def test_pending_request_list_paginates_before_returning_cursor() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.params.get("pageToken") == "page-2":
+            return httpx.Response(
+                200,
+                json={"requests": [_pending_payload("bc-2")], "streamCursor": "cursor-1"},
+            )
+        return httpx.Response(
+            200,
+            json={
+                "requests": [_pending_payload()],
+                "nextPageToken": "page-2",
+                "streamCursor": "cursor-1",
+            },
+        )
+
+    with _client(handler) as client:
+        pending, cursor = list_pending_requests(client)
+
+    assert [request.request_id for request in pending] == ["bc-1", "bc-2"]
+    assert cursor == "cursor-1"
+    assert requests[1].url.params["pageToken"] == "page-2"
 
 
 def test_claim_pending_request_uses_cursor_claim_contract() -> None:

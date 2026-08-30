@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import random
 import time
 import uuid
 from collections.abc import Mapping
@@ -16,6 +17,7 @@ import httpx
 from modal_cursor.pools import Machine
 from modal_cursor.registry import (
     PendingRequest,
+    Repository,
     claim_pending_request,
     cursor_client,
     list_pending_requests,
@@ -48,6 +50,8 @@ class PoolSpec:
 
 
 HTTP_GONE = 410
+PENDING_REQUEST_RESYNC_MIN_S = 180.0
+PENDING_REQUEST_RESYNC_MAX_S = 240.0
 
 
 class _Dispatcher:
@@ -120,6 +124,18 @@ class _Dispatcher:
                 },
             ) as current:
                 try:
+                    if spec.pool.repo_url is not None:
+                        request_urls = request.repo_urls or (
+                            (request.repo_url,) if request.repo_url else ()
+                        )
+                        request_repositories = {
+                            Repository.from_url(url).url for url in request_urls
+                        }
+                        if spec.pool.repo_url not in request_repositories:
+                            raise ValueError(
+                                f"request repositories {sorted(request_repositories)!r} do not "
+                                f"match repo-backed pool {spec.pool.repo_url!r}"
+                            )
                     if not claim_exists:
                         claim_pending_request(self._client, request.request_id, worker_id)
                         claim_acquired = True
@@ -164,7 +180,9 @@ def _register_pools(client: httpx.Client, specs: tuple[PoolSpec, ...]) -> None:
                 register_pool(client, spec.pool.registration)
 
 
-def run_control_plane(app: modal.App, specs: tuple[PoolSpec, ...]) -> None:
+def run_control_plane(  # noqa: PLR0912 - explicit long-running queue state machine
+    app: modal.App, specs: tuple[PoolSpec, ...]
+) -> None:
     """Register all pools and dispatch requests from one unfiltered Cursor stream.
 
     This loop is intentionally not represented by one process-lifetime span.
@@ -181,10 +199,15 @@ def run_control_plane(app: modal.App, specs: tuple[PoolSpec, ...]) -> None:
         try:
             while True:
                 requests, cursor = list_pending_requests(client)
+                resync_at = time.monotonic() + random.uniform(
+                    PENDING_REQUEST_RESYNC_MIN_S, PENDING_REQUEST_RESYNC_MAX_S
+                )
                 for request in requests:
                     dispatcher.submit(request, claim_exists=request.claimed_worker_id is not None)
                 try:
                     for event in watch_pending_requests(client, cursor):
+                        if time.monotonic() >= resync_at:
+                            break
                         if event.cursor:
                             cursor = event.cursor
                         if event.request is None:

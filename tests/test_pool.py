@@ -26,13 +26,14 @@ def test_invalid_pool_names(name: str) -> None:
 
 
 def test_pool_validates_current_registration_contract() -> None:
-    pool = Pool(
-        name="payments",
-        repo_url="https://github.com/acme/payments.git",
-        worker_ready_timeout_s=900,
-    )
+    pool = Pool(name="payments", repo_url="https://github.com/acme/payments.git")
     assert pool.repo_url == "https://github.com/acme/payments"
-    assert pool.registration.request_body()["workerReadyTimeoutSeconds"] == 900
+    assert pool.registration.request_body()["workerReadyTimeoutSeconds"] == 0
+    with pytest.raises(ValidationError, match="snapshot/restore") as error:
+        Pool(name="payments", worker_ready_timeout_s=900)
+    assert (
+        error.value.errors()[0]["type"] == "pool_worker_ready_timeout_s_requires_snapshot_restore"
+    )
     with pytest.raises(ValidationError, match="HTTPS GitHub") as error:
         Pool(name="bad", repo_url="https://gitlab.com/acme/project")
     assert error.value.errors()[0]["type"] == "pool_repo_url_must_be_github_https"
@@ -61,12 +62,11 @@ def test_register_uses_pool_metadata(monkeypatch: pytest.MonkeyPatch) -> None:
     Pool(
         name="payments",
         repo_url="https://github.com/acme/payments",
-        worker_ready_timeout_s=600,
     ).register()
 
     body = json.loads(requests[0].content)
     assert body["repoOwner"] == "acme"
-    assert body["workerReadyTimeoutSeconds"] == 600
+    assert body["workerReadyTimeoutSeconds"] == 0
 
 
 def test_control_plane_image_declares_claim_validation_runtime() -> None:

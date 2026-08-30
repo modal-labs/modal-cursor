@@ -29,17 +29,23 @@ def _init(
     return tmp_path / "demo-pool.py"
 
 
-def _registry_payload(name: str = "demo-pool", *, connected: int = 0) -> dict[str, object]:
-    return {
+def _registry_payload(
+    name: str = "demo-pool", *, connected: int = 0, repo_url: str | None = None
+) -> dict[str, object]:
+    payload: dict[str, object] = {
         "scope": "team",
         "poolName": name,
         "connectedWorkerCount": connected,
         "inUseWorkerCount": 0,
         "workerReadyTimeoutSeconds": 0,
-        "repoOwner": "acme",
-        "repoName": "app",
-        "repoUrl": "https://github.com/acme/app",
     }
+    if repo_url is not None:
+        payload.update(
+            repoOwner="acme",
+            repoName="app",
+            repoUrl=repo_url,
+        )
+    return payload
 
 
 def test_init_generates_pool_configuration(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -47,7 +53,6 @@ def test_init_generates_pool_configuration(tmp_path: Path, monkeypatch: pytest.M
         tmp_path,
         monkeypatch,
         repo_url="https://github.com/acme/app",
-        worker_ready_timeout_s=900,
     )
     namespace = runpy.run_path(str(generated))
     source = generated.read_text()
@@ -56,7 +61,7 @@ def test_init_generates_pool_configuration(tmp_path: Path, monkeypatch: pytest.M
     assert "SpawnServer(" not in source
     assert "spawn_worker(" not in source
     assert "app =" not in source
-    assert namespace["pool"].worker_ready_timeout_s == 900
+    assert namespace["pool"].worker_ready_timeout_s == 0
     assert namespace["CURSOR_SECRET_NAME"] == "cursor-service-account"
     assert namespace["LOGFIRE_SECRET_NAME"] == "logfire-token"
     assert namespace["WORKER_SECRET_NAMES"] == ()
@@ -227,7 +232,9 @@ def test_destroy_uses_registry_repo_identity(
     def handler(request: httpx.Request) -> httpx.Response:
         requests.append(request)
         if request.method == "GET":
-            return httpx.Response(200, json={"pools": [_registry_payload()]})
+            return httpx.Response(
+                200, json={"pools": [_registry_payload(repo_url="https://github.com/acme/app")]}
+            )
         return httpx.Response(200, json={"deregistered": True})
 
     client = httpx.Client(base_url="https://cursor.test", transport=httpx.MockTransport(handler))
@@ -317,3 +324,22 @@ def test_doctor_fails_for_deployed_app_without_controller_runner(
     with pytest.raises(SystemExit) as error:
         cli.doctor(pools_dir=tmp_path)
     assert error.value.code == 1
+
+
+def test_doctor_detects_registry_configuration_drift(tmp_path: Path, monkeypatch) -> None:
+    _init(tmp_path, monkeypatch, repo_url="https://github.com/acme/app")
+    registered = RegisteredPool.from_payload(
+        _registry_payload(repo_url="https://github.com/acme/app")
+        | {"workerReadyTimeoutSeconds": 900}
+    )
+    failures = cli._check_registry(
+        [
+            (
+                tmp_path / "demo-pool.py",
+                Pool(name="demo-pool", repo_url="https://github.com/acme/app"),
+            )
+        ],
+        [registered],
+        "team",
+    )
+    assert failures == 1

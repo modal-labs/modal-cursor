@@ -45,6 +45,28 @@ def test_dispatch_releases_claim_when_provisioning_fails(monkeypatch) -> None:
     controller_module.release_claim.assert_called_once_with(client, "bc-1")
 
 
+def test_dispatch_rejects_request_for_wrong_repo_backed_pool(monkeypatch) -> None:
+    pool = Pool(name="gpu", repo_url="https://github.com/acme/payments")
+    worker = pool.machine(image="image")
+    client = Mock()
+    monkeypatch.setattr(controller_module, "claim_pending_request", Mock())
+    monkeypatch.setattr(controller_module, "spawn_worker", Mock())
+    dispatcher = _Dispatcher(Mock(), (PoolSpec(worker=worker, pool=pool),), client)
+
+    dispatcher._dispatch(
+        PendingRequest(
+            request_id="bc-1",
+            pool="gpu",
+            repo_url="https://github.com/acme/other",
+        ),
+        claim_exists=False,
+    )
+    dispatcher.close()
+
+    controller_module.claim_pending_request.assert_not_called()
+    controller_module.spawn_worker.assert_not_called()
+
+
 def test_async_dispatch_is_visible_root_with_discovery_link(
     monkeypatch, capfire: CaptureLogfire
 ) -> None:
