@@ -65,7 +65,7 @@ def configure_telemetry() -> None:
         return
     try:
         logfire.configure(
-            send_to_logfire="if-token-present",
+            send_to_logfire=False,
             service_name=os.environ.get("OTEL_SERVICE_NAME", "modal-cursor"),
             console=False,
             inspect_arguments=False,

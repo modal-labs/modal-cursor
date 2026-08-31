@@ -50,9 +50,6 @@ ScopeOption = Annotated[Literal["team", "user"], cyclopts.Parameter(help="Cursor
 SecretNameOption = Annotated[
     str, cyclopts.Parameter(help="Modal Secret containing CURSOR_API_KEY.")
 ]
-LogfireSecretNameOption = Annotated[
-    str, cyclopts.Parameter(help="Modal Secret containing LOGFIRE_TOKEN.")
-]
 PoolFileArg = Annotated[
     Path, cyclopts.Parameter(help="Generated pool file; omit to use --pools-dir.")
 ]
@@ -175,7 +172,6 @@ def _required_secrets(pool_file: Path) -> set[str]:
         target = node.targets[0]
         if not isinstance(target, ast.Name) or target.id not in {
             "CURSOR_SECRET_NAME",
-            "LOGFIRE_SECRET_NAME",
             "WORKER_SECRET_NAMES",
         }:
             continue
@@ -187,19 +183,13 @@ def _required_secrets(pool_file: Path) -> set[str]:
     worker_secrets = values.get("WORKER_SECRET_NAMES", ())
     if not isinstance(cursor_secret, str) or not cursor_secret:
         raise ConfigError(f"{pool_file}: CURSOR_SECRET_NAME is missing")
-    logfire_secret = values.get("LOGFIRE_SECRET_NAME")
-    if logfire_secret is not None and (not isinstance(logfire_secret, str) or not logfire_secret):
-        raise ConfigError(f"{pool_file}: LOGFIRE_SECRET_NAME is missing")
     if not isinstance(worker_secrets, (tuple, list)):
         raise ConfigError(f"{pool_file}: WORKER_SECRET_NAMES must be a sequence of names")
     raw_names = tuple(cast(Iterable[object], worker_secrets))
     names = tuple(name for name in raw_names if isinstance(name, str))
     if len(names) != len(raw_names) or not all(names):
         raise ConfigError(f"{pool_file}: WORKER_SECRET_NAMES must be a sequence of names")
-    required = {cursor_secret, *names}
-    if isinstance(logfire_secret, str):
-        required.add(logfire_secret)
-    return required
+    return {cursor_secret, *names}
 
 
 def _deploy_and_start(files: list[Path]) -> bool:
@@ -472,7 +462,6 @@ def init_pool(  # noqa: PLR0912 - one linear CLI workflow with explicit user dec
     scope: ScopeOption = "team",
     api_endpoint: ApiEndpointOption = DEFAULT_API_ENDPOINT,
     secret_name: SecretNameOption = "cursor-service-account",
-    logfire_secret_name: LogfireSecretNameOption = "logfire-token",
     pools_dir: PoolsDirOption = Path("pools"),
     deploy: Annotated[
         bool | None, cyclopts.Parameter(help="Deploy after generating the file.")
@@ -489,8 +478,6 @@ def init_pool(  # noqa: PLR0912 - one linear CLI workflow with explicit user dec
         name = _ask("Pool name")
     if not secret_name.strip():
         raise SystemExit("secret_name must not be empty")
-    if not logfire_secret_name.strip():
-        raise SystemExit("logfire_secret_name must not be empty")
     if private_repo and not repo_url:
         raise SystemExit("--private-repo requires --repo-url")
     if private_repo and not github_secret_name.strip():
@@ -524,7 +511,6 @@ def init_pool(  # noqa: PLR0912 - one linear CLI workflow with explicit user dec
         pool_options=pool_options,
         app_name=repr(pool.app_name),
         secret_name=repr(secret_name),
-        logfire_secret_name=repr(logfire_secret_name),
         worker_secret_names=repr(worker_secret_names),
     )
     try:
@@ -548,11 +534,6 @@ def init_pool(  # noqa: PLR0912 - one linear CLI workflow with explicit user dec
         interactive=interactive,
         value=os.environ.get("CURSOR_API_KEY"),
     )
-    if logfire_secret_name not in existing_secrets:
-        _warn(
-            f"Modal Secret {logfire_secret_name!r} is missing; create it with a LOGFIRE_TOKEN "
-            "before deploying to export telemetry"
-        )
     if private_repo:
         _ensure_modal_secret(
             name=github_secret_name,

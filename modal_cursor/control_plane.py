@@ -23,7 +23,6 @@ class _PoolConfig:
     path: Path
     spec: PoolSpec
     cursor_secret_name: str
-    logfire_secret_name: str
 
 
 def _configured_paths() -> tuple[Path, ...]:
@@ -40,20 +39,16 @@ def _load_config(path: Path) -> _PoolConfig:
     pool = namespace.get("pool")
     worker = namespace.get("worker")
     cursor_secret_name = namespace.get("CURSOR_SECRET_NAME")
-    logfire_secret_name = namespace.get("LOGFIRE_SECRET_NAME")
     if not isinstance(pool, Pool):
         raise ValueError(f"{path} must define a modal_cursor.pool.Pool named 'pool'")
     if not isinstance(worker, Machine):
         raise ValueError(f"{path} must define a modal_cursor.pools.Machine named 'worker'")
     if not isinstance(cursor_secret_name, str) or not cursor_secret_name:
         raise ValueError(f"{path} must define CURSOR_SECRET_NAME")
-    if not isinstance(logfire_secret_name, str) or not logfire_secret_name:
-        raise ValueError(f"{path} must define LOGFIRE_SECRET_NAME")
     return _PoolConfig(
         path=path,
         spec=PoolSpec(pool=pool, worker=worker),
         cursor_secret_name=cursor_secret_name,
-        logfire_secret_name=logfire_secret_name,
     )
 
 
@@ -66,8 +61,6 @@ def _load_configs(paths: tuple[Path, ...]) -> tuple[_PoolConfig, ...]:
     configs = tuple(_load_config(path) for path in paths)
     if len({config.cursor_secret_name for config in configs}) != 1:
         raise ValueError("all pool files must use the same CURSOR_SECRET_NAME")
-    if len({config.logfire_secret_name for config in configs}) != 1:
-        raise ValueError("all pool files must use the same LOGFIRE_SECRET_NAME")
     return configs
 
 
@@ -83,10 +76,7 @@ if _CONFIGS:
     _cursor_secret = modal.Secret.from_name(
         _CONFIGS[0].cursor_secret_name, required_keys=["CURSOR_API_KEY"]
     )
-    _logfire_secret = modal.Secret.from_name(
-        _CONFIGS[0].logfire_secret_name, required_keys=["LOGFIRE_TOKEN"]
-    )
-    _function_secrets = [_cursor_secret, _logfire_secret]
+    _function_secrets = [_cursor_secret]
     _controller_image = _SPECS[0].pool.control_plane_image()
     for _config in _CONFIGS:
         _controller_image = _controller_image.add_local_file(

@@ -110,13 +110,12 @@ uv run modal deploy modal_cursor/otel_proxy.py
 ```
 
 Use the printed `modal.run` URL as Cursor's collector base URL, without `/v1`.
-Add an `X-Logfire-Token` header whose value is the write token stored in the
-configured telemetry Modal Secret, then enable logs and metrics. The bridge
-forwards `/v1/logs` and `/v1/metrics` to the configured backend and returns a
-protobuf acknowledgement. `Authorization` is also accepted, but the
-dedicated header avoids client-specific authorization-header handling. Deploy
-behind a separate ingress credential if the endpoint will be shared beyond
-this team.
+Add an `X-Logfire-Token` header whose value matches the bridge's configured
+upstream write token, then enable logs and metrics. The bridge forwards
+`/v1/logs` and `/v1/metrics` to the configured backend and returns a protobuf
+acknowledgement. `Authorization` is also accepted, but the dedicated header
+avoids client-specific authorization-header handling. Deploy behind a separate
+ingress credential if the endpoint will be shared beyond this team.
 
 The controller does not keep one process-lifetime span open: exporters only
 make completed spans queryable, and a durable controller would otherwise hide

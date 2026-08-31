@@ -63,7 +63,6 @@ def test_init_generates_pool_configuration(tmp_path: Path, monkeypatch: pytest.M
     assert "app =" not in source
     assert namespace["pool"].worker_ready_timeout_s == 0
     assert namespace["CURSOR_SECRET_NAME"] == "cursor-service-account"
-    assert namespace["LOGFIRE_SECRET_NAME"] == "logfire-token"
     assert namespace["WORKER_SECRET_NAMES"] == ()
     assert namespace["worker"].image is not None
 
@@ -83,7 +82,6 @@ def test_private_repo_configures_github_secret(
     assert cli._required_secrets(generated) == {
         "cursor-service-account",
         "github-token",
-        "logfire-token",
     }
 
 
