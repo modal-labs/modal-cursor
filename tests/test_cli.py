@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import runpy
 import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, call
 
 import httpx
 import modal
@@ -22,9 +23,7 @@ def _init(
     **kwargs: object,
 ) -> Path:
     monkeypatch.setattr(cli, "_interactive", lambda: False)
-    monkeypatch.setattr(
-        cli, "_secret_names", lambda: {"cursor-service-account", "github-token", "logfire-token"}
-    )
+    monkeypatch.setattr(cli, "_secret_names", lambda: {"cursor-service-account", "github-token"})
     cli.init_pool(name="demo-pool", pools_dir=tmp_path, **kwargs)
     return tmp_path / "demo-pool.py"
 
@@ -107,6 +106,7 @@ def test_deploy_starts_single_control_plane(
     deployed: list[list[Path]] = []
     monkeypatch.setattr(cli, "_modal_deploy", lambda files: deployed.append(list(files)) or 0)
     controller = Mock()
+    controller.get_current_stats.return_value = SimpleNamespace(num_total_runners=1)
     from_name = Mock(return_value=controller)
     monkeypatch.setattr(cli.modal.Function, "from_name", from_name)
 
@@ -115,6 +115,19 @@ def test_deploy_starts_single_control_plane(
     from_name.assert_called_once_with(cli.CONTROL_PLANE_APP_NAME, "controller")
     controller.spawn.assert_called_once_with()
     assert deployed == [[tmp_path / "demo-pool.py"]]
+
+
+def test_deploy_reports_pending_controller_without_claiming_ready(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    generated = _init(tmp_path, monkeypatch)
+    monkeypatch.setattr(cli, "_modal_deploy", Mock(return_value=0))
+    controller = Mock()
+    monkeypatch.setattr(cli.modal.Function, "from_name", Mock(return_value=controller))
+    monkeypatch.setattr(cli, "_wait_for_controller", Mock(return_value=False))
+
+    assert cli._deploy_and_start([generated])
+    controller.spawn.assert_called_once_with()
 
 
 def test_subprocess_boundaries_and_configuration_probe(
@@ -136,6 +149,92 @@ def test_subprocess_boundaries_and_configuration_probe(
 
     monkeypatch.setattr(cli, "_modal", Mock(side_effect=subprocess.TimeoutExpired("modal", 30)))
     assert not cli._modal_is_configured()
+
+
+def test_interactive_deploy_uses_live_tail_runner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(cli, "_interactive", lambda: True)
+    run_with_tail = Mock(return_value=0)
+    monkeypatch.setattr(cli, "_run_with_tail", run_with_tail)
+
+    assert cli._modal_deploy(tmp_path / "gpu.py") == 0
+
+    run_with_tail.assert_called_once()
+    argv = run_with_tail.call_args.args[0]
+    assert argv[:5] == [sys.executable, "-m", "modal", "deploy", "--strategy"]
+    assert argv[5] == "recreate"
+    assert run_with_tail.call_args.kwargs["env"][cli.POOL_FILES_ENV].endswith("gpu.py")
+
+
+def test_run_with_tail_returns_process_code() -> None:
+    assert cli._run_with_tail([sys.executable, "-c", "print('deploy output')"]) == 0
+    assert (
+        cli._run_with_tail([sys.executable, "-c", "print('deploy failed'); raise SystemExit(3)"])
+        == 3
+    )
+
+
+def test_init_interactive_wizard_configures_any_repo_pool_and_deploys(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(cli, "_interactive", lambda: True)
+    monkeypatch.setattr(cli, "_modal_is_configured", lambda: True)
+    monkeypatch.setattr(cli, "_secret_names", Mock(return_value=set()))
+    answers = iter(
+        [
+            "production-pool",
+            "cursor-key",
+        ]
+    )
+    monkeypatch.setattr(cli, "_ask", lambda question, **kwargs: next(answers))
+    confirmations = iter([True, True])
+    monkeypatch.setattr(cli, "_confirm", lambda question, **kwargs: next(confirmations))
+    create_secret = Mock()
+    monkeypatch.setattr(
+        cli.modal,
+        "Secret",
+        SimpleNamespace(objects=SimpleNamespace(create=create_secret)),
+    )
+    deploy = Mock(return_value=True)
+    monkeypatch.setattr(cli, "_deploy_and_start", deploy)
+
+    cli.init_pool(pools_dir=tmp_path)
+
+    generated = tmp_path / "production-pool.py"
+    assert generated.exists()
+    source = generated.read_text()
+    assert "repo_url" not in source
+    assert create_secret.call_args_list == [
+        call("cursor-service-account", {"CURSOR_API_KEY": "cursor-key"})
+    ]
+    deploy.assert_called_once_with([generated])
+
+
+def test_init_refuses_deploy_when_required_secret_is_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(cli, "_interactive", lambda: False)
+    monkeypatch.setattr(cli, "_secret_names", Mock(return_value=set()))
+
+    with pytest.raises(SystemExit, match="Deployment prerequisites are missing"):
+        cli.init_pool(name="demo-pool", pools_dir=tmp_path, deploy=True)
+
+
+def test_deploy_and_start_reports_deploy_and_controller_failures(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    generated = _init(tmp_path, monkeypatch)
+    monkeypatch.setattr(cli, "_modal_deploy", lambda files: 1)
+    assert not cli._deploy_and_start([generated])
+
+    monkeypatch.setattr(cli, "_modal_deploy", lambda files: 0)
+    monkeypatch.setattr(
+        cli.modal.Function,
+        "from_name",
+        Mock(side_effect=modal.exception.RemoteError("controller unavailable")),
+    )
+    assert not cli._deploy_and_start([generated])
 
 
 def test_pool_file_and_secret_validation(tmp_path: Path) -> None:

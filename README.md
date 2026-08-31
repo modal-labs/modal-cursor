@@ -1,6 +1,6 @@
 # modal-cursor
 
-Run Cursor bring-your-own-machine worker pools on Modal. One durable Modal
+Run Cursor BYOM worker pools on Modal. One durable Modal
 control-plane controller owns registration and dispatch for every configured
 Cursor pool, then creates an isolated sandbox for each claimed request.
 
@@ -9,22 +9,30 @@ This project targets Python 3.11 and newer.
 ## Quickstart
 
 ```bash
-uv sync --all-groups
-uv run modal setup
-export CURSOR_API_KEY="your-service-account-key"
-uv run modal-cursor init gpu-training
-uv run modal-cursor deploy
-uv run modal-cursor doctor
+uvx modal-cursor init
+uvx modal-cursor doctor
 ```
 
-`init` writes an editable `pools/gpu-training.py` configuration. Customize its
-worker image, resources, secrets, and Modal sandbox options before deploying
-the all-pools control plane.
+The interactive wizard configures Modal if needed, prompts for the Cursor
+service-account key, creates the `cursor-service-account` Modal Secret, writes
+an editable pool configuration, and offers to deploy the all-pools control
+plane. Pass a pool name for a scriptable flow; set `CURSOR_API_KEY` in the
+environment when running without a terminal:
+
+```bash
+export CURSOR_API_KEY="your-service-account-key"
+uvx modal-cursor init gpu-training --no-deploy
+uvx modal-cursor deploy
+```
+
+`init` writes `pools/gpu-training.py`. Customize its worker image, resources,
+secrets, and Modal sandbox options before deploying the all-pools control
+plane.
 
 For a repository-scoped pool:
 
 ```bash
-uv run modal-cursor init payments \
+uvx modal-cursor init payments \
   --repo-url https://github.com/acme/payments
 ```
 
@@ -40,7 +48,7 @@ registry record—including `repo_owner` and `repo_name` for repository-scoped
 pools—to deregister it:
 
 ```bash
-uv run modal-cursor destroy pools/payments.py --yes
+uvx modal-cursor destroy pools/payments.py --yes
 ```
 
 ## Runtime design
@@ -100,23 +108,6 @@ effect on pool operation.
 Spans include pool, request, worker, sandbox, and outcome metadata, but never
 Cursor API keys, Modal Secrets, or complete claim/machine payloads.
 
-Cursor's Enterprise OpenTelemetry Export can be routed through the optional
-authenticated Modal bridge when a backend's OTLP acknowledgement is too strict
-for Cursor's connection test. Set `OTEL_EXPORTER_OTLP_ENDPOINT` to the
-backend's base URL, then deploy it with:
-
-```console
-uv run modal deploy modal_cursor/otel_proxy.py
-```
-
-Use the printed `modal.run` URL as Cursor's collector base URL, without `/v1`.
-Add an `X-Logfire-Token` header whose value matches the bridge's configured
-upstream write token, then enable logs and metrics. The bridge forwards
-`/v1/logs` and `/v1/metrics` to the configured backend and returns a protobuf
-acknowledgement. `Authorization` is also accepted, but the dedicated header
-avoids client-specific authorization-header handling. Deploy behind a separate
-ingress credential if the endpoint will be shared beyond this team.
-
 The controller does not keep one process-lifetime span open: exporters only
 make completed spans queryable, and a durable controller would otherwise hide
 its root indefinitely. Registration and pending-request polling are bounded
@@ -172,7 +163,6 @@ the selected pool files to construct one shared Modal application.
 ## Development
 
 ```bash
-uv sync --all-groups
 uv run ruff format --check modal_cursor tests
 uv run ruff check modal_cursor tests
 uv run mypy
