@@ -8,7 +8,7 @@ from modal_cursor.otel_proxy import create_web_app
 
 
 def test_otel_proxy_requires_authentication() -> None:
-    client = TestClient(create_web_app("secret", logfire_endpoint="https://logfire.test"))
+    client = TestClient(create_web_app("secret", otlp_endpoint="https://logfire.test"))
 
     response = client.post(
         "/v1/logs",
@@ -20,7 +20,7 @@ def test_otel_proxy_requires_authentication() -> None:
 
 
 def test_otel_proxy_requires_protobuf_content_type() -> None:
-    client = TestClient(create_web_app("secret", logfire_endpoint="https://logfire.test"))
+    client = TestClient(create_web_app("secret", otlp_endpoint="https://logfire.test"))
 
     response = client.post("/v1/logs", content=b"payload", headers={"Authorization": "secret"})
 
@@ -41,7 +41,7 @@ def test_otel_proxy_normalizes_success_response(monkeypatch) -> None:
             return upstream
 
     monkeypatch.setattr("modal_cursor.otel_proxy.httpx.AsyncClient", lambda **kwargs: FakeClient())
-    client = TestClient(create_web_app("secret", logfire_endpoint="https://logfire.test"))
+    client = TestClient(create_web_app("secret", otlp_endpoint="https://logfire.test"))
 
     response = client.post(
         "/v1/metrics",

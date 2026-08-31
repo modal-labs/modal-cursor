@@ -85,36 +85,38 @@ Secret, and unsets it before launching the Cursor agent.
 Runtime tuning is available through the optional `MODAL_CURSOR_SANDBOX_TIMEOUT_S`,
 `MODAL_CURSOR_IDLE_RELEASE_TIMEOUT_S`, `MODAL_CURSOR_SPAWNER_READY_TIMEOUT_S`,
 `MODAL_CURSOR_WORKER_POLL_INTERVAL_S`, `MODAL_CURSOR_CONTROLLER_TIMEOUT_S`, and
-`MODAL_CURSOR_CONTROLLER_MAX_RETRIES` environment variables.
+`MODAL_CURSOR_CONTROLLER_MAX_RETRIES` environment variables. Set the standard
+`OTEL_EXPORTER_OTLP_ENDPOINT` environment variable to choose the base URL for
+OTLP/HTTP telemetry export; it is validated with the other Pydantic runtime
+settings and propagated to the deployed control plane. `OTEL_SERVICE_NAME`
+controls the emitted service name.
 
 ## Observability
 
-Lifecycle spans and Cursor API request spans are emitted with
-[Pydantic Logfire](https://logfire.pydantic.dev/). Set `LOGFIRE_TOKEN` in the
-`logfire-token` Modal Secret (or pass another name with
-`modal-cursor init --logfire-secret-name`) to send them to Logfire; without a
-token, instrumentation is quiet and has no effect on pool operation. The
-default service name is `modal-cursor` and can be changed with
-`LOGFIRE_SERVICE_NAME`.
+Lifecycle spans and Cursor API request spans are emitted as OpenTelemetry
+spans. Set `OTEL_EXPORTER_OTLP_ENDPOINT` to the base URL of an OTLP-compatible
+backend. Without an export configuration, instrumentation is quiet and has no
+effect on pool operation.
 Spans include pool, request, worker, sandbox, and outcome metadata, but never
 Cursor API keys, Modal Secrets, or complete claim/machine payloads.
 
 Cursor's Enterprise OpenTelemetry Export can be routed through the optional
 authenticated Modal bridge when a backend's OTLP acknowledgement is too strict
-for Cursor's connection test. Deploy it with:
+for Cursor's connection test. Set `OTEL_EXPORTER_OTLP_ENDPOINT` to the
+backend's base URL, then deploy it with:
 
 ```console
 uv run modal deploy modal_cursor/otel_proxy.py
 ```
 
 Use the printed `modal.run` URL as Cursor's collector base URL, without `/v1`.
-Add an `X-Logfire-Token` header whose value is the Logfire write token stored in
-the `logfire-token` Modal Secret, then enable logs and metrics. The bridge
-forwards `/v1/logs` and `/v1/metrics` to Logfire and returns a protobuf
-acknowledgement. It uses the existing Logfire token for inbound authentication;
-deploy behind a separate ingress credential if the endpoint will be shared
-beyond this team. `Authorization` is also accepted, but the dedicated header
-avoids client-specific authorization-header handling.
+Add an `X-Logfire-Token` header whose value is the write token stored in the
+configured telemetry Modal Secret, then enable logs and metrics. The bridge
+forwards `/v1/logs` and `/v1/metrics` to the configured backend and returns a
+protobuf acknowledgement. `Authorization` is also accepted, but the
+dedicated header avoids client-specific authorization-header handling. Deploy
+behind a separate ingress credential if the endpoint will be shared beyond
+this team.
 
 The controller does not keep one process-lifetime span open: exporters only
 make completed spans queryable, and a durable controller would otherwise hide

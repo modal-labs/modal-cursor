@@ -48,6 +48,22 @@ class RuntimeSettings(BaseSettings):
 
     model_config = SettingsConfigDict(env_prefix="MODAL_CURSOR_", extra="ignore")
 
+    otel_exporter_otlp_endpoint: str | None = Field(
+        default=None,
+        validation_alias="OTEL_EXPORTER_OTLP_ENDPOINT",
+        description="Base URL for the OpenTelemetry OTLP/HTTP exporter.",
+    )
+
+    @field_validator("otel_exporter_otlp_endpoint")
+    @classmethod
+    def _valid_otel_exporter_endpoint(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        parsed = urlsplit(value)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise ValueError("OTEL_EXPORTER_OTLP_ENDPOINT must be an HTTP(S) URL")
+        return value.rstrip("/")
+
     sandbox_timeout_s: Annotated[
         int, Field(gt=0, description="Maximum lifetime of each Modal worker sandbox in seconds.")
     ] = 6 * 3600

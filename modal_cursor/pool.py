@@ -121,11 +121,15 @@ class Pool(BaseModel):
 
     def control_plane_image(self) -> modal.Image:
         """Build the lightweight image used by the all-pools control plane."""
-        return (
+        image = (
             modal.Image.debian_slim()
             .uv_pip_install(*_CONTROLLER_DEPENDENCIES)
             .add_local_python_source("modal_cursor", copy=True)
         )
+        endpoint = RuntimeSettings().otel_exporter_otlp_endpoint
+        if endpoint:
+            image = image.env({"OTEL_EXPORTER_OTLP_ENDPOINT": endpoint})
+        return image
 
     def worker_image(self) -> modal.Image:
         """Cursor CLI and git; callers may append application-specific layers."""

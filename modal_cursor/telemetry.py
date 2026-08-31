@@ -1,4 +1,4 @@
-"""Best-effort Logfire instrumentation for modal-cursor lifecycle operations."""
+"""Best-effort OpenTelemetry instrumentation for modal-cursor lifecycle operations."""
 
 from __future__ import annotations
 
@@ -66,7 +66,7 @@ def configure_telemetry() -> None:
     try:
         logfire.configure(
             send_to_logfire="if-token-present",
-            service_name=os.environ.get("LOGFIRE_SERVICE_NAME", "modal-cursor"),
+            service_name=os.environ.get("OTEL_SERVICE_NAME", "modal-cursor"),
             console=False,
             inspect_arguments=False,
             distributed_tracing=True,

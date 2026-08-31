@@ -1,4 +1,4 @@
-"""Authenticated OTLP/HTTP bridge from Cursor to Logfire."""
+"""Authenticated OTLP/HTTP bridge from Cursor to an OTLP backend."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import PlainTextResponse, Response
 
 APP_NAME = "modal-cursor-otel-bridge"
-LOGFIRE_ENDPOINT = os.environ.get("LOGFIRE_OTLP_ENDPOINT", "https://logfire-us.pydantic.dev")
+OTLP_ENDPOINT = os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT", "https://logfire-us.pydantic.dev")
 LOGFIRE_SECRET_NAME = os.environ.get("LOGFIRE_SECRET_NAME", "logfire-token")
 
 app = modal.App(APP_NAME)
@@ -41,7 +41,7 @@ def _request_is_authorized(request: Request, expected: str) -> bool:
     )
 
 
-def create_web_app(logfire_token: str, *, logfire_endpoint: str = LOGFIRE_ENDPOINT) -> FastAPI:
+def create_web_app(logfire_token: str, *, otlp_endpoint: str = OTLP_ENDPOINT) -> FastAPI:
     """Build the authenticated OTLP bridge application."""
     web_app = FastAPI()
 
@@ -65,7 +65,7 @@ def create_web_app(logfire_token: str, *, logfire_endpoint: str = LOGFIRE_ENDPOI
         try:
             async with httpx.AsyncClient(timeout=30.0, follow_redirects=False) as client:
                 upstream = await client.post(
-                    f"{logfire_endpoint}/v1/{signal}", content=body, headers=headers
+                    f"{otlp_endpoint}/v1/{signal}", content=body, headers=headers
                 )
         except httpx.HTTPError:
             return PlainTextResponse(

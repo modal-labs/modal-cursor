@@ -44,12 +44,14 @@ def test_claim_reads_required_cursor_settings(monkeypatch: pytest.MonkeyPatch) -
 
 
 def test_runtime_settings_read_operator_overrides(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "https://otel.example.test")
     monkeypatch.setenv("MODAL_CURSOR_SANDBOX_TIMEOUT_S", "900")
     monkeypatch.setenv("MODAL_CURSOR_IDLE_RELEASE_TIMEOUT_S", "30")
     monkeypatch.setenv("MODAL_CURSOR_SPAWNER_READY_TIMEOUT_S", "45")
     monkeypatch.setenv("MODAL_CURSOR_WORKER_POLL_INTERVAL_S", "0.5")
 
     assert RuntimeSettings().model_dump() == {
+        "otel_exporter_otlp_endpoint": "https://otel.example.test",
         "sandbox_timeout_s": 900,
         "idle_release_timeout_s": 30,
         "spawner_ready_timeout_s": 45.0,
