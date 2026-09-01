@@ -30,7 +30,6 @@ def test_control_plane_can_import_before_pool_files_are_mounted(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.delenv(control_plane.POOL_FILES_ENV, raising=False)
-    monkeypatch.setattr(control_plane, "_BUNDLED_POOL_DIR", tmp_path / "not-mounted")
     monkeypatch.chdir(tmp_path)
 
     namespace = runpy.run_path(str(Path(control_plane.__file__)))

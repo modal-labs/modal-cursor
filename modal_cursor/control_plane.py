@@ -29,9 +29,16 @@ def _configured_paths() -> tuple[Path, ...]:
     configured = os.environ.get(POOL_FILES_ENV)
     if configured:
         return tuple(Path(item).resolve() for item in configured.split(os.pathsep) if item)
-    if _BUNDLED_POOL_DIR.is_dir():
-        return tuple(sorted(_BUNDLED_POOL_DIR.glob("*.py")))
+    # The bundled directory exists only in the deployed function image. Do not
+    # inspect it while the app module is being imported: on some hosts, merely
+    # stat-ing /root is not permitted. Local execution has its own explicit
+    # fallback, and the deployed function discovers bundled files at invoke time.
     return tuple(sorted(Path("pools").glob("*.py")))
+
+
+def _bundled_paths() -> tuple[Path, ...]:
+    """Find pool files after Modal has mounted the function image."""
+    return tuple(sorted(_BUNDLED_POOL_DIR.glob("*.py")))
 
 
 def _load_config(path: Path) -> _PoolConfig:
@@ -98,7 +105,5 @@ else:
 )
 def controller() -> None:
     """Own registration, discovery, claiming, and sandbox dispatch for all pools."""
-    specs = _SPECS or tuple(
-        config.spec for config in _load_configs(tuple(sorted(_BUNDLED_POOL_DIR.glob("*.py"))))
-    )
+    specs = _SPECS or tuple(config.spec for config in _load_configs(_bundled_paths()))
     run_control_plane(app, specs)
