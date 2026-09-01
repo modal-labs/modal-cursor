@@ -1,29 +1,37 @@
-# Run Cursor BYOM Pools on Modal
+# Run Cursor Cloud Agents on Modal
 
-Modal Cursor runs [Cursor Bring Your Own Machine (BYOM) pools](https://cursor.com/docs/cloud-agent/bring-your-own-machine)
-in [Modal Sandboxes](https://modal.com/docs/guide/sandboxes). Cursor owns the
-Cloud Agent request and pool APIs; Modal Cursor registers pools, claims pending
-requests, and creates a sandbox for each claim.
+Use [Cursor Bring Your Own Machine (BYOM) pools](https://cursor.com/docs/cloud-agent/bring-your-own-machine)
+to run Cursor Cloud Agent workers in [Modal Sandboxes](https://modal.com/docs/guide/sandboxes).
+Select the pool in Cursor, and Modal Cursor starts a Modal Sandbox for each
+Cloud Agent session.
 
 ## Before you begin
 
 - Python 3.11 or newer
 - [`uv`](https://docs.astral.sh/uv/)
-- A [Modal account](https://modal.com/docs/guide/modal-user-account-setup); the
-  wizard can configure the Modal CLI
-- A Cursor service-account API key with access to the worker-pool API
+- A [Modal account](https://modal.com/docs/guide/modal-user-account-setup)
+- A Cursor service-account API key for pool workers
 
 Install `uv` with the
-[official standalone installer](https://docs.astral.sh/uv/getting-started/installation/):
+[official standalone installer](https://docs.astral.sh/uv/getting-started/installation/)
+if it is not already installed:
 
 ```bash
 curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
 
-The default configuration uses a Modal Secret named
-`cursor-service-account` containing `CURSOR_API_KEY`.
+The default configuration uses a [Modal Secret](https://modal.com/docs/guide/secrets)
+named `cursor-service-account` containing `CURSOR_API_KEY`.
+
+`CURSOR_API_KEY` is a long-lived service-account key. It is available in each
+Cursor worker's environment, so code running in a worker sandbox can read it.
+Treat worker code and images as part of this key's trust boundary, and do not
+print the key or include it in logs.
 
 ## Deploy a worker pool
+
+Give the pool a recognizable name, such as `gpu-training`. You will select this
+name in Cursor when starting a Cloud Agent session.
 
 Run the interactive setup wizard:
 
@@ -31,10 +39,17 @@ Run the interactive setup wizard:
 uvx modal-cursor init
 ```
 
+Run these commands from the directory where you want to keep the integration
+configuration, such as the root of a small deployment repository. By default,
+`init` writes `pools/<pool-name>.py` relative to the current directory. The
+`deploy`, `doctor`, and `destroy` commands also look for pool files in `pools/`
+relative to the current directory; use `--pools-dir` to use a different
+directory.
+
 The wizard configures Modal if needed, asks for a pool name and Cursor
 service-account key, creates the `cursor-service-account` Secret, writes the
-pool file, and offers to deploy it. Accept the deployment prompt to start the
-control plane.
+pool file, and offers to deploy it. Accept the deployment prompt to deploy the
+Modal service that registers and serves the pool.
 
 To review or edit the generated file before deploying, pass a name and
 `--no-deploy` instead:
@@ -43,9 +58,7 @@ To review or edit the generated file before deploying, pass a name and
 uvx modal-cursor init gpu-training --no-deploy
 ```
 
-After editing, deploy all pool files in `pools/`. See Modal's guide to
-[managing deployments](https://modal.com/docs/guide/managing-deployments) for
-the underlying deployment behavior:
+After editing, deploy all pool files in `pools/`:
 
 ```bash
 uvx modal-cursor deploy
@@ -59,17 +72,24 @@ uvx modal-cursor doctor
 
 ## Start a Cloud Agent
 
-In Cursor, start a Cloud Agent using the workflow you normally use. In the
-worker or environment selector, choose the `gpu-training` pool before starting
-the session.
+In Cursor, open the Cloud Agents dashboard and start a session using the
+workflow you normally use. In the session's worker or machine selector, choose
+the BYOM pool you created—in this example, `gpu-training`—before starting the
+session. The pool is listed after deployment finishes and Cursor has received
+the pool; run `uvx modal-cursor doctor` if it is not available.
 
-Modal Cursor claims the session, creates a Modal sandbox, starts the Cursor
-worker, and waits for Cursor to report the worker as connected.
+After you start the session, Cursor places the request in that pool. Modal
+Cursor claims it, creates a Modal sandbox, starts the Cursor worker, and waits
+for Cursor to report the worker as connected. The session then runs on that
+sandbox.
 
 ## Configure repositories and workers
 
 The generated pool file is ordinary Python. For example, `uvx modal-cursor init
-gpu-training` writes:
+gpu-training` writes a file containing the pool and secret declarations below.
+`CURSOR_SECRET_NAME` names the Modal Secret containing the Cursor
+service-account key. Leave `WORKER_SECRET_NAMES` empty unless the worker needs
+additional secrets; add the names of those Modal Secrets to it when needed.
 
 ```python
 """Generated configuration for one editable Cursor worker pool."""
@@ -91,11 +111,9 @@ worker = pool.machine(
 )
 ```
 
-Set worker resources in the `pool.machine()` call. The generated file is the
-file you edit when configuring the pool. See Modal's guides for [GPU
-acceleration](https://modal.com/docs/guide/gpu) and [CPU, memory, and disk
-configuration](https://modal.com/docs/guide/resources) for the available
-resource options.
+Set worker resources in the `pool.machine()` call. See Modal's guides for
+[GPU acceleration](https://modal.com/docs/guide/gpu) and [CPU, memory, and disk
+configuration](https://modal.com/docs/guide/resources).
 
 ### Repository-scoped pools
 
@@ -109,7 +127,7 @@ uvx modal-cursor init payments \
 ```
 
 Only URLs in the form `https://github.com/<owner>/<repo>` are accepted. The
-repository identity is included in the Cursor pool registration.
+repository URL associates requests for that repository with the pool.
 
 For a private repository, add `--private-repo`. The wizard prompts for the
 GitHub token and creates the `github-token` Secret:
@@ -121,8 +139,11 @@ uvx modal-cursor init payments \
   --no-deploy
 ```
 
-`GITHUB_TOKEN` is supplied to a temporary Git credential helper for the clone
-and is unset before the Cursor worker starts.
+`GITHUB_TOKEN` is used only for the initial clone and is removed before the
+Cursor worker starts. It is not embedded in the remote URL or available to the
+worker. The worker can edit files and create local commits; fetching, pulling,
+or pushing a private repository requires separate credentials configured for
+the worker.
 
 ### Custom worker images
 
@@ -139,19 +160,16 @@ worker_image = (
 
 worker = pool.machine(
     image=worker_image,
+    secrets=[modal.Secret.from_name(name) for name in WORKER_SECRET_NAMES],
     gpu="A10G",
 )
 ```
 
-`pool.machine()` also accepts worker environment values, [Modal
-Secrets](https://modal.com/docs/guide/secrets), sandbox timeouts, idle-release
-settings, and [Modal Sandbox](https://modal.com/docs/guide/sandboxes) options.
-Cursor-managed environment variables and options such as `image`, `secrets`,
-and `timeout` cannot be overridden.
-
-Pool names are routing keys used by Cursor. A name must be 1–50 characters,
-contain only lowercase letters, digits, and dashes, and start and end with a
-letter or digit.
+`pool.machine()` is where you customize the worker image, resources, extra
+secrets, and [Modal Sandbox](https://modal.com/docs/guide/sandboxes) settings.
+Derive custom images from `pool.worker_image()` so the pinned Cursor agent CLI
+and Git remain available. Add extra Modal Secret names to
+`WORKER_SECRET_NAMES`.
 
 After changing a pool file, deploy again:
 
@@ -161,7 +179,7 @@ uvx modal-cursor deploy
 
 ## Remove a deployment
 
-To stop the control plane and deregister one pool:
+To stop the Modal deployment and remove one pool from Cursor:
 
 ```bash
 uvx modal-cursor destroy pools/gpu-training.py --yes
@@ -172,6 +190,13 @@ To remove all pools in `pools/`:
 ```bash
 uvx modal-cursor destroy --yes
 ```
+
+`destroy` stops the shared Modal deployment and removes the matching pool from
+Cursor. Because all pool files use one shared service, destroying one pool also
+stops new sessions for every pool until you deploy again. It does not delete
+the local pool files or Modal Secrets.
+
+Existing sessions and worker sandboxes are covered in the Reference section.
 
 ## Reference
 
@@ -187,6 +212,22 @@ The deployment has two parts:
 The controller consumes Cursor's pending-request stream and routes requests by
 the `pool` label. A worker connects to Cursor over an outbound connection, with
 no inbound port or public IP address.
+
+The integration passes each `Machine`'s image, worker secrets, environment,
+timeout, and the shared Modal app to `modal.Sandbox.create`. Configure these
+values through `pool.machine()`; do not pass `image`, `secrets`, `env`,
+`timeout`, or `app` again through `sandbox_options`, because those fields are
+reserved by modal-cursor.
+
+### Stopping a deployment
+
+`destroy` stops the `modal-cursor-control-plane` Modal application and removes
+the Cursor pool records that match the pool files you selected. It stops the
+controller's running container, but does not explicitly terminate worker
+sandboxes for sessions that are already running. Those sessions can continue
+until their worker exits or its sandbox lifetime or idle limit is reached. The
+local pool files and Modal Secrets are preserved, and no new sessions are
+claimed while the application is stopped.
 
 ### Request lifecycle
 
@@ -208,8 +249,8 @@ remain unavailable.
 
 ### Runtime settings
 
-The following environment variables change lifecycle defaults for the
-controller and workers:
+The following environment variables change lifecycle defaults for the controller
+and workers:
 
 | Variable | Purpose | Default |
 | --- | --- | ---: |
@@ -236,15 +277,11 @@ payloads.
 
 ### Credentials
 
-`CURSOR_API_KEY` is a long-lived service-account key. The controller receives it
-from the `CURSOR_SECRET_NAME` Modal Secret and passes it to the Cursor worker
-environment. Treat the controller and worker sandboxes as part of this key's
-trust boundary.
+The controller receives `CURSOR_API_KEY` from the `CURSOR_SECRET_NAME` Modal
+Secret and passes it to the Cursor worker environment.
 
 For private repositories, `GITHUB_TOKEN` is separate from the Cursor key and is
 used only during the clone step. It is removed before the worker starts.
 
-For implementation details and development commands, see
-[`README.md`](README.md). The external API references are the
-[Cursor Cloud Agents API](https://cursor.com/docs/cloud-agent/api/endpoints)
-and [Modal documentation](https://modal.com/docs).
+The [modal-cursor source repository](https://github.com/modal-labs/modal-cursor)
+contains implementation details and the package release workflow.

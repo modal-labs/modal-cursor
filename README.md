@@ -1,164 +1,62 @@
 # modal-cursor
 
-Run Cursor BYOM worker pools on Modal. One durable Modal
-control-plane controller owns registration and dispatch for every configured
-Cursor pool, then creates an isolated sandbox for each claimed request.
+Run [Cursor Cloud Agents](https://cursor.com/docs/cloud-agent) in
+[Modal Sandboxes](https://modal.com/docs/guide/sandboxes) with Cursor BYOM
+pools. Select a pool in Cursor, and Modal Cursor starts a Modal Sandbox for
+each Cloud Agent session.
 
-This project targets Python 3.11 and newer.
+## Getting started
 
-## Quickstart
+You need Python 3.11 or newer, [`uv`](https://docs.astral.sh/uv/), a
+[Modal account](https://modal.com/docs/guide/modal-user-account-setup), and a
+Cursor service-account API key for pool workers.
+
+Install `uv` if it is not already installed:
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+
+From the directory where you want to keep the integration configuration, run:
 
 ```bash
 uvx modal-cursor init
-uvx modal-cursor doctor
 ```
 
-The interactive wizard configures Modal if needed, prompts for the Cursor
+The wizard configures Modal if needed, asks for a pool name and Cursor
 service-account key, creates the `cursor-service-account` Modal Secret, writes
-an editable pool configuration, and offers to deploy the all-pools control
-plane. Pass a pool name for a scriptable flow; set `CURSOR_API_KEY` in the
-environment when running without a terminal:
+`pools/<pool-name>.py`, and offers to deploy the Modal service that registers
+and serves the pool.
+
+To review or edit the generated file before deploying:
 
 ```bash
 export CURSOR_API_KEY="your-service-account-key"
 uvx modal-cursor init gpu-training --no-deploy
 uvx modal-cursor deploy
+uvx modal-cursor doctor
 ```
 
-`init` writes `pools/gpu-training.py`. Customize its worker image, resources,
-secrets, and Modal sandbox options before deploying the all-pools control
-plane.
+Start a Cloud Agent in Cursor and select `gpu-training` in its worker or
+machine selector. Modal Cursor claims the request, creates a sandbox, starts
+the Cursor worker, and waits for Cursor to report it as connected.
 
-For a repository-scoped pool:
+For the complete walkthrough and configuration reference, see
+[`example.md`](example.md). The same example is published in the
+[Modal documentation](https://modal.com/docs/examples/cursor).
 
-```bash
-uvx modal-cursor init payments \
-  --repo-url https://github.com/acme/payments
-```
+## How it works
 
-Add `--private-repo` to configure a worker-side Modal secret containing
-`GITHUB_TOKEN`. The token is used by a temporary Git credential helper during
-clone and is removed before the Cursor worker starts; it is not written into
-the repository remote URL. Only HTTPS `github.com/<owner>/<repo>` URLs are
-accepted; unsupported repository hosts fail during configuration instead of
-during a worker launch.
+- A shared Modal application named `modal-cursor-control-plane` runs the
+  controller for all generated pool files.
+- The controller watches Cursor's pending requests and routes them by pool.
+- Each claimed request creates an ephemeral Modal Sandbox from its pool's
+  `Machine` configuration.
+- The sandbox clones the requested repository and starts the Cursor worker.
 
-Destroying a pool stops the shared Modal control plane and uses the live Cursor
-registry record—including `repo_owner` and `repo_name` for repository-scoped
-pools—to deregister it:
-
-```bash
-uvx modal-cursor destroy pools/payments.py --yes
-```
-
-## Runtime design
-
-The runtime has four small boundaries:
-
-- `Pool` owns the canonical pool name, repository scope, Cursor registration,
-  and the pinned worker/control-plane images.
-- `Machine` is an immutable worker specification. It rejects environment names
-  and Modal options that would override values needed by the worker.
-- `Claim` is a Pydantic Settings model for the non-secret values passed from
-  the controller to sandbox provisioning.
-- `registry.py` owns typed request and response models for the Cursor pool and
-  claim APIs. Unexpected success payloads fail loudly.
-
-The control plane uses Cursor's unfiltered pending-request stream, routes each
-request by its pool label, atomically claims it, and provisions the matching
-Modal sandbox. The provisioner monitors the sandbox until Cursor exposes the
-claimed worker ID, failing on an early sandbox exit or readiness timeout; a
-failed claim is released for retry.
-
-This deployment uses ephemeral Modal sandboxes, so it registers
-`workerReadyTimeoutSeconds=0`: follow-ups reacquire on a fresh sandbox after a
-worker exits. Snapshot/restore hibernation is not supported; nonzero reconnect
-windows are rejected during configuration. The controller image installs a
-versioned, SHA-256-verified Cursor CLI lab-channel archive instead of
-executing an unpinned remote install script.
-
-## Credentials
-
-`CURSOR_API_KEY` is a long-lived Cursor service-account key—not a claim-scoped
-credential. Store it in a Modal Secret (the generated default is
-`cursor-service-account`) and treat every controller and worker sandbox as part
-of that credential's trust boundary.
-
-The controller receives this key from its Modal Secret and injects it directly
-into the worker environment because the Cursor worker CLI requires it. Private
-repository credentials are separate: the clone shell receives `GITHUB_TOKEN`
-only when its generated configuration includes the requested GitHub Modal
-Secret, and unsets it before launching the Cursor agent.
-
-Runtime tuning is available through the optional `MODAL_CURSOR_SANDBOX_TIMEOUT_S`,
-`MODAL_CURSOR_IDLE_RELEASE_TIMEOUT_S`, `MODAL_CURSOR_SPAWNER_READY_TIMEOUT_S`,
-`MODAL_CURSOR_WORKER_POLL_INTERVAL_S`, `MODAL_CURSOR_CONTROLLER_TIMEOUT_S`, and
-`MODAL_CURSOR_CONTROLLER_MAX_RETRIES` environment variables. Set the standard
-`OTEL_EXPORTER_OTLP_ENDPOINT` environment variable to choose the base URL for
-OTLP/HTTP telemetry export; it is validated with the other Pydantic runtime
-settings and propagated to the deployed control plane. `OTEL_SERVICE_NAME`
-controls the emitted service name.
-
-## Observability
-
-Lifecycle spans and Cursor API request spans are emitted as OpenTelemetry
-spans. Set `OTEL_EXPORTER_OTLP_ENDPOINT` to the base URL of an OTLP-compatible
-backend. Without an export configuration, instrumentation is quiet and has no
-effect on pool operation.
-Spans include pool, request, worker, sandbox, and outcome metadata, but never
-Cursor API keys, Modal Secrets, or complete claim/machine payloads.
-
-The controller does not keep one process-lifetime span open: exporters only
-make completed spans queryable, and a durable controller would otherwise hide
-its root indefinitely. Registration and pending-request polling are bounded
-operational spans. Each asynchronous request dispatch is its own visible root
-trace, with a span link back to the controller context at discovery time, so
-concurrent requests do not merge into one waterfall:
-
-```text
-Control-plane operational spans:
-├─ modal_cursor.controller.startup
-│  ├─ modal_cursor.pool.register
-│  └─ modal_cursor.pool.register
-└─ modal_cursor.registry.list_pending_requests
-
-Per-request trace (linked to controller discovery context):
-modal_cursor.controller.dispatch
-├─ modal_cursor.registry.claim_pending_request
-└─ modal_cursor.worker.provision
-   ├─ modal_cursor.worker.create_sandbox
-   └─ modal_cursor.worker.wait_for_cursor_registration
-      ├─ modal_cursor.worker.registration.poll # attempt=1, not_ready
-      │  └─ GET 404                       # not visible to Cursor yet
-      └─ modal_cursor.worker.registration.poll # attempt=2, ready
-         └─ GET 200                     # worker connected
-```
-
-Cursor's Enterprise OpenTelemetry export is logs and metrics, not a parent
-trace emitted by the Cursor worker controller. The controller therefore owns
-the request lifecycle and uses the Cursor request/conversation ID as a
-correlation attribute. Cursor's records can be joined in Logfire by
-`cursor.conversation.id`, but they cannot be made children of our Modal spans
-without a W3C trace context from Cursor. Because discovery and dispatch cross
-an asynchronous queue/thread boundary, the controller uses a span link rather
-than pretending the dispatch is a synchronous child of the polling loop.
-Registration-wait spans record whether the sandbox process remained alive,
-whether registration was pending, the poll count, the registration outcome,
-and the registration elapsed time. Each registration poll remains a child
-span, making the interval before the worker becomes visible to Cursor explicit
-without turning routine state transitions into extra records.
-
-## Operations
-
-`modal-cursor doctor` checks more than object existence. It verifies Modal
-credentials, declared secrets, the shared control-plane container, the Cursor
-registry response schema, registration drift, and connected/in-use worker
-counts. Zero connected workers is valid for a scale-to-zero pool; zero running
-control-plane containers is not.
-
-Pool files remain ordinary Python configuration modules. The CLI reads only
-their literal secret declarations for diagnostics; the deployment module loads
-the selected pool files to construct one shared Modal application.
+Workers connect outbound to Cursor and do not need an inbound port or public IP
+address. Workers are ephemeral; snapshot/restore hibernation and nonzero
+`workerReadyTimeoutSeconds` are not supported.
 
 ## Development
 
@@ -172,16 +70,11 @@ uv run coverage report
 uv build
 ```
 
-The test suite is self-contained; it has no sibling path dependency. The
-separate `cursor-mock` repository mirrors the current repository-aware
-deregistration contract for larger integration tests.
+The test suite mocks Modal and Cursor network boundaries. Run a disposable live
+soak test before using a new Cursor CLI release in production.
 
-Unit tests mock Modal and Cursor network boundaries. They do not prove that a
-new Cursor CLI release can enroll and serve a real agent. Before a production
-release, run a disposable live soak test: deploy a pool, create and claim an
-agent, observe the worker connect and finish a run, then destroy the pool.
+## References
 
-Cursor's API is public beta and may change. Compare releases against the
-[Cursor Cloud Agents API](https://cursor.com/docs/cloud-agent/api/endpoints) and
-the [Modal documentation](https://modal.com/docs) before upgrading pinned
-runtime components.
+- [Cursor Cloud Agents API](https://cursor.com/docs/cloud-agent/api/endpoints)
+- [Cursor BYOM](https://cursor.com/docs/cloud-agent/bring-your-own-machine)
+- [Modal documentation](https://modal.com/docs)
