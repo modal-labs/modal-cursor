@@ -2,8 +2,8 @@
 
 Run [Cursor Cloud Agents](https://cursor.com/docs/cloud-agent) in
 [Modal Sandboxes](https://modal.com/docs/guide/sandboxes) with Cursor
-Self-Hosted Machines pools. Select a pool in Cursor, and Modal Cursor starts a
-Modal Sandbox for each Cloud Agent session.
+Self-Hosted Machines. Select a pool in Cursor, and Modal Cursor starts a Modal
+Sandbox for each Cloud Agent session.
 
 ## Getting started
 
