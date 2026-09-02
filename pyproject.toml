@@ -41,7 +41,7 @@ plugins = ["pydantic.mypy"]
 [project]
 name = "modal-cursor"
 version = "0.1.1"
-description = "Modal-backed controller for Cursor bring-your-own-machine worker pools."
+description = "Modal-backed controller for Cursor Self-Hosted Machines worker pools."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [

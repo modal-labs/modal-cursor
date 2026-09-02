@@ -1,9 +1,9 @@
 # modal-cursor
 
 Run [Cursor Cloud Agents](https://cursor.com/docs/cloud-agent) in
-[Modal Sandboxes](https://modal.com/docs/guide/sandboxes) with Cursor BYOM
-pools. Select a pool in Cursor, and Modal Cursor starts a Modal Sandbox for
-each Cloud Agent session.
+[Modal Sandboxes](https://modal.com/docs/guide/sandboxes) with Cursor
+Self-Hosted Machines pools. Select a pool in Cursor, and Modal Cursor starts a
+Modal Sandbox for each Cloud Agent session.
 
 ## Getting started
 
@@ -58,6 +58,15 @@ Workers connect outbound to Cursor and do not need an inbound port or public IP
 address. Workers are ephemeral; snapshot/restore hibernation and nonzero
 `workerReadyTimeoutSeconds` are not supported.
 
+## Observability
+
+Modal Cursor emits OpenTelemetry spans for pool registration, request polling
+and claims, sandbox provisioning, worker registration, and outcomes. Set
+`OTEL_EXPORTER_OTLP_ENDPOINT` to an OTLP/HTTP endpoint and optionally set
+`OTEL_SERVICE_NAME` to customize the service name. Without an export endpoint,
+instrumentation is quiet. Spans omit API keys, Modal Secret values, and complete
+claim or machine payloads.
+
 ## Development
 
 ```bash
@@ -76,5 +85,5 @@ soak test before using a new Cursor CLI release in production.
 ## References
 
 - [Cursor Cloud Agents API](https://cursor.com/docs/cloud-agent/api/endpoints)
-- [Cursor BYOM](https://cursor.com/docs/cloud-agent/bring-your-own-machine)
+- [Cursor Self-Hosted Machines](https://cursor.com/docs/cloud-agent/self-hosted/pool)
 - [Modal documentation](https://modal.com/docs)

@@ -1,4 +1,4 @@
-"""Modal-backed controller for Cursor bring-your-own-machine worker pools."""
+"""Modal-backed controller for Cursor Self-Hosted Machines worker pools."""
 
 from __future__ import annotations
 

@@ -1,6 +1,6 @@
 # Run Cursor Cloud Agents on Modal
 
-Use [Cursor Bring Your Own Machine (BYOM) pools](https://cursor.com/docs/cloud-agent/bring-your-own-machine)
+Use [Cursor Self-Hosted Machines pools](https://cursor.com/docs/cloud-agent/self-hosted/pool)
 to run Cursor Cloud Agent workers in [Modal Sandboxes](https://modal.com/docs/guide/sandboxes).
 Select the pool in Cursor, and Modal Cursor starts a Modal Sandbox for each
 Cloud Agent session.
@@ -74,9 +74,9 @@ uvx modal-cursor doctor
 
 In Cursor, open the Cloud Agents dashboard and start a session using the
 workflow you normally use. In the session's worker or machine selector, choose
-the BYOM pool you created—in this example, `gpu-training`—before starting the
-session. The pool is listed after deployment finishes and Cursor has received
-the pool; run `uvx modal-cursor doctor` if it is not available.
+the Self-Hosted Machines pool you created—in this example, `gpu-training`—before
+starting the session. The pool is listed after deployment finishes and Cursor
+has received the pool; run `uvx modal-cursor doctor` if it is not available.
 
 After you start the session, Cursor places the request in that pool. Modal
 Cursor claims it, creates a Modal sandbox, starts the Cursor worker, and waits
